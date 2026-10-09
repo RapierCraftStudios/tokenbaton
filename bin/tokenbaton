@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# tokenbaton: run Claude Code and, whenever it exits, offer to resume the
+# conversation this window was last in, on the next logged-in account, in the
+# same window.
+# Follows in-session /resume and /clear by watching Claude Code's live session
+# record ($CLAUDE_CONFIG_DIR/sessions/<pid>.json) for this window's process.
+# Auto-switch: once the account's session (5-hour) usage reaches
+# TOKENBATON_SWITCH_AT percent (default 99) and Claude is idle, it is closed and
+# the conversation resumes on the next account with room, without prompting.
+# Set TOKENBATON_SWITCH_AT=0 to turn this off. Manual switch: /exit, Enter.
+#   tokenbaton [N] [claude args...]   (N = starting profile; default: last used)
+set -uo pipefail
+COUNT="${TOKENBATON_PROFILES:-5}"
+SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
+POLL=60
+ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
+PROFILE_CMD="$(dirname "$(readlink -f "$0")")/tokenbaton-profile"
+STATE="$ACC/current"
+TRACK="$ACC/go.$$.session"
+CUR="$ACC/go.$$.profile"
+AUTO="$ACC/go.$$.auto"
+mkdir -p "$ACC"
+
+# A profile is usable if it has a refresh token that hasn't expired. Read the
+# file directly: `claude auth status` grabs the refresh lock on an expired
+# access token and exits without releasing it, which then blocks every real
+# session's auto-refresh ("another Claude Code process is refreshing it").
+logged_in() {
+  python3 -I - "$HOME/.claude-$1/.credentials.json" <<'PY' 2>/dev/null
+import json, sys, time
+o = json.load(open(sys.argv[1])).get("claudeAiOauth") or {}
+exp = o.get("refreshTokenExpiresAt")
+sys.exit(0 if o.get("refreshToken") and (not exp or exp / 1000 > time.time()) else 1)
+PY
+}
+
+# Print a profile's usage percent (the higher of session and weekly), cached
+# for $POLL seconds and shared by all windows. Prints nothing if unknown (e.g.
+# the access token expired; Claude Code refreshes it on launch).
+usage() {
+  local cache="$ACC/usage.$1"
+  if [[ -z "$(find "$cache" -maxdepth 0 -newermt "-$POLL seconds" 2>/dev/null)" ]]; then
+    python3 -I - "$HOME/.claude-$1/.credentials.json" > "$cache.tmp" <<'PY' 2>/dev/null
+import json, sys, urllib.request
+tok = json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"]
+req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+    "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"})
+d = json.load(urllib.request.urlopen(req, timeout=15))
+print(int(max((d.get(k) or {}).get("utilization") or 0 for k in ("five_hour", "seven_day"))))
+PY
+    mv -f "$cache.tmp" "$cache"
+  fi
+  cat "$cache" 2>/dev/null
+}
+
+has_room() {
+  local u
+  (( SWITCH_AT > 0 )) || return 0
+  u="$(usage "$1")"
+  [[ -z "$u" ]] || (( u < SWITCH_AT ))
+}
+
+# Remove ~/.claude-N.lock if it's over a minute old and no live process is
+# running on that profile, so a crashed refresh can't block the next one.
+clear_stale_lock() {
+  local dir="$HOME/.claude-$1" lock="$HOME/.claude-$1.lock" p
+  [[ -d "$lock" ]] || return 0
+  [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]] || return 0
+  for p in /proc/[0-9]*/environ; do
+    grep -qzx "CLAUDE_CONFIG_DIR=$dir" "$p" 2>/dev/null && return 0
+  done
+  rmdir "$lock" 2>/dev/null && echo "tokenbaton: cleared stale refresh lock for profile $1" >&2
+}
+
+launch() {
+  clear_stale_lock "$1"
+  echo "$1" > "$CUR"
+  "$PROFILE_CMD" "$@"
+}
+
+# Next logged-in profile after $1 with usage below the switch threshold.
+next_profile() {
+  local cur="$1" i n
+  for (( i = 1; i < COUNT; i++ )); do
+    n=$(( (cur + i - 1) % COUNT + 1 ))
+    if logged_in "$n" && has_room "$n"; then echo "$n"; return 0; fi
+  done
+  return 1
+}
+
+# Map an ID to a saved conversation. If no transcript has that name (the window
+# was launched with an ID, then moved to another chat via /resume), use the
+# newest transcript whose entries were written by a process with that ID.
+resolve_session() {
+  local id="$1" f
+  for f in "$HOME"/.claude/projects/*/"$id".jsonl; do
+    [[ -e "$f" ]] && { echo "$id"; return 0; }
+  done
+  f="$(grep -l --include='*.jsonl' -r "\"session_id\":\"$id\"" "$HOME/.claude/projects" 2>/dev/null \
+       | grep -v '/subagents/' | xargs -r ls -t 2>/dev/null | head -1)"
+  [[ -n "$f" ]] || return 1
+  f="${f##*/}"; echo "${f%.jsonl}"
+}
+
+# True if the conversation's last turn was cut off by a usage limit.
+hit_limit() {
+  local f
+  f="$(ls -t "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)"
+  [[ -n "$f" ]] && tail -n 50 "$f" | grep -E '"type":"(user|assistant)"' | tail -1 \
+    | grep -q '"error":"rate_limit"'
+}
+
+# Record the sessionId of whichever claude process is our direct child, and
+# leave its pid and status ("idle", "busy", ...) in $child / $status.
+snapshot() {
+  local f pid sid
+  child=""; status=""
+  for f in "$HOME"/.claude-[0-9]*/sessions/*.json; do
+    [[ -e "$f" ]] || continue
+    pid="${f##*/}"; pid="${pid%.json}"
+    [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "$$" ]] || continue
+    sid="$(grep -o '"sessionId":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
+    [[ -n "$sid" ]] && echo "$sid" > "$TRACK"
+    child="$pid"
+    status="$(grep -o '"status":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
+  done
+}
+
+# Close an idle Claude whose account is at the threshold, if another account
+# has room; the main loop then resumes the conversation there.
+maybe_switch() {
+  local p u
+  (( SWITCH_AT > 0 )) && [[ -n "$child" && "$status" == idle && ! -e "$AUTO" ]] || return 0
+  p="$(cat "$CUR" 2>/dev/null)"; [[ -n "$p" ]] || return 0
+  u="$(usage "$p")"; [[ -n "$u" ]] && (( u >= SWITCH_AT )) || return 0
+  next_profile "$p" > /dev/null || return 0
+  echo "$p $u" > "$AUTO"
+  kill -TERM "$child" 2>/dev/null
+}
+
+watch() {
+  local t=0
+  while kill -0 "$$" 2>/dev/null; do
+    snapshot
+    (( t++ % 15 == 0 )) && maybe_switch
+    sleep 1
+  done
+}
+
+watch &
+watcher=$!
+trap 'kill "$watcher" 2>/dev/null; rm -f "$TRACK" "$CUR" "$AUTO"' EXIT
+
+profile="$(cat "$STATE" 2>/dev/null || echo 1)"
+if [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= COUNT )); then profile="$1"; shift; fi
+[[ "$profile" =~ ^[0-9]+$ ]] && (( profile >= 1 && profile <= COUNT )) || profile=1
+
+# Start pinned to a fresh ID unless the caller already chose a session.
+case " $* " in
+  *" -c "*|*" --continue "*|*" -r "*|*" --resume"*|*" --session-id"*)
+    launch "$profile" "$@" ;;
+  *)
+    sid="$(cat /proc/sys/kernel/random/uuid)"
+    echo "$sid" > "$TRACK"
+    launch "$profile" --session-id "$sid" "$@" ;;
+esac
+
+while true; do
+  session="$(cat "$TRACK" 2>/dev/null || true)"
+  [[ -n "$session" ]] && session="$(resolve_session "$session" || true)"
+  echo >&2
+  auto=""
+  if [[ -e "$AUTO" ]]; then
+    auto=1; read -r p u < "$AUTO"; rm -f "$AUTO"
+    echo "tokenbaton: account $p is at ${u}% usage; switching ${session:0:8} automatically" >&2
+  else
+    read -r -p "tokenbaton: [Enter] continue ${session:0:8} on next account, q to quit: " ans || break
+    [[ "$ans" == q* ]] && break
+  fi
+  if ! next="$(next_profile "$profile")"; then
+    echo "tokenbaton: no other logged-in profile with usage below ${SWITCH_AT}%" >&2
+    continue
+  fi
+  profile="$next"
+  if [[ -n "$session" && -n "$auto" ]] && hit_limit "$session"; then
+    launch "$profile" --resume "$session" "continue"
+  elif [[ -n "$session" ]]; then
+    launch "$profile" --resume "$session"
+  elif [[ -n "$auto" ]]; then
+    # Nothing was said yet, so there's no transcript; --continue would grab
+    # some other conversation in this directory. Start fresh instead.
+    launch "$profile"
+  else
+    launch "$profile" --continue
+  fi
+done

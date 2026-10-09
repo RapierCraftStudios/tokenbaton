@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Run the official Claude Code CLI under one of N account profiles.
+# Each profile (~/.claude-N) keeps its own login; sessions, memory, settings,
+# plugins and prompt history are symlinked to ~/.claude so they are shared.
+#   tokenbaton-profile <N> [claude args...]
+set -euo pipefail
+
+COUNT="${TOKENBATON_PROFILES:-5}"
+BASE="$HOME/.claude"
+ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
+STATE="$ACC/current"
+SHARED=(projects file-history history.jsonl settings.json CLAUDE.md commands
+        agents skills plugins plans keybindings.json)
+# Small config files that tools may rewrite in place of the symlink. A rewritten
+# copy is folded back into the shared file (newer wins, older kept as backup).
+RELINK=(settings.json keybindings.json CLAUDE.md)
+
+n="${1:-}"
+if ! [[ "$n" =~ ^[0-9]+$ ]] || (( n < 1 || n > COUNT )); then
+  echo "usage: tokenbaton-profile <1-$COUNT> [claude args...]" >&2
+  exit 2
+fi
+shift
+
+relink() {
+  local item="$1" src="$2" dst="$3" bk
+  bk="$ACC/relink-backup"
+  mkdir -p "$bk"
+  if ! cmp -s "$src" "$dst"; then
+    if [[ "$dst" -nt "$src" ]]; then
+      cp -p "$src" "$bk/$item.shared.$(date +%Y%m%d-%H%M%S)"
+      cp -p "$dst" "$src"
+      echo "tokenbaton-profile: merged newer $dst into shared $src" >&2
+    else
+      cp -p "$dst" "$bk/$item.claude-$n.$(date +%Y%m%d-%H%M%S)"
+      echo "tokenbaton-profile: kept shared $src; older $dst backed up" >&2
+    fi
+  fi
+  ln -sfn "$src" "$dst"
+}
+
+dir="$HOME/.claude-$n"
+mkdir -p "$dir"
+for item in "${SHARED[@]}"; do
+  src="$BASE/$item"
+  dst="$dir/$item"
+  [[ -e "$src" ]] || continue
+  if [[ -L "$dst" ]]; then
+    continue
+  elif [[ -f "$dst" && " ${RELINK[*]} " == *" $item "* ]]; then
+    relink "$item" "$src" "$dst"
+  elif [[ -e "$dst" ]]; then
+    echo "tokenbaton-profile: $dst exists and is not a symlink; not sharing it" >&2
+  else
+    ln -s "$src" "$dst"
+  fi
+done
+
+mkdir -p "$(dirname "$STATE")"
+echo "$n" > "$STATE"
+echo "tokenbaton-profile: account $n ($dir)" >&2
+CLAUDE_CONFIG_DIR="$dir" exec claude "$@"
