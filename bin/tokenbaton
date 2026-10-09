@@ -102,11 +102,13 @@ resolve_session() {
   f="${f##*/}"; echo "${f%.jsonl}"
 }
 
-# True if the conversation's last turn was cut off by a usage limit.
+# True if Claude's last reply in the conversation was a usage-limit error.
+# Look at assistant entries only: background-task notifications can queue up
+# as user entries after the error, and they're still unanswered.
 hit_limit() {
   local f
   f="$(ls -t "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)"
-  [[ -n "$f" ]] && tail -n 50 "$f" | grep -E '"type":"(user|assistant)"' | tail -1 \
+  [[ -n "$f" ]] && tail -n 300 "$f" | grep '"type":"assistant"' | tail -1 \
     | grep -q '"error":"rate_limit"'
 }
 
