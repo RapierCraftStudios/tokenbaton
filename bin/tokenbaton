@@ -40,7 +40,8 @@ PY
 usage() {
   local cache="$ACC/usage.$1"
   if [[ -z "$(find "$cache" -maxdepth 0 -newermt "-$POLL seconds" 2>/dev/null)" ]]; then
-    python3 -I - "$HOME/.claude-$1/.credentials.json" > "$cache.tmp" <<'PY' 2>/dev/null
+    local tmp="$cache.$BASHPID.tmp"
+    python3 -I - "$HOME/.claude-$1/.credentials.json" > "$tmp" <<'PY' 2>/dev/null
 import json, sys, urllib.request
 tok = json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"]
 req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
@@ -48,7 +49,7 @@ req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", header
 d = json.load(urllib.request.urlopen(req, timeout=15))
 print(int(max((d.get(k) or {}).get("utilization") or 0 for k in ("five_hour", "seven_day"))))
 PY
-    mv -f "$cache.tmp" "$cache"
+    mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp"
   fi
   cat "$cache" 2>/dev/null
 }
@@ -149,7 +150,9 @@ watch() {
   done
 }
 
-watch &
+# The watcher shares the terminal with Claude Code's full-screen UI, so it
+# must never print there; anything it says goes to a log instead.
+watch > /dev/null 2>> "$ACC/go.log" &
 watcher=$!
 trap 'kill "$watcher" 2>/dev/null; rm -f "$TRACK" "$CUR" "$AUTO"' EXIT
 
