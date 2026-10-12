@@ -13,6 +13,7 @@ set -uo pipefail
 COUNT="${TOKENBATON_PROFILES:-5}"
 SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
 POLL=60
+BACKOFF=300   # after a failed usage check (e.g. HTTP 429), wait this long
 ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
 PROFILE_CMD="$(dirname "$(readlink -f "$0")")/tokenbaton-profile"
 STATE="$ACC/current"
@@ -37,24 +38,47 @@ sys.exit(0 if o.get("refreshToken") and (not exp or exp / 1000 > time.time()) el
 PY
 }
 
-# Print a profile's usage percent (the higher of session and weekly), cached
-# for $POLL seconds and shared by all windows. Prints nothing if unknown (e.g.
-# the access token expired; Claude Code refreshes it on launch).
+# Print a profile's usage percent, cached for $POLL seconds and shared by all
+# windows. Prints nothing if unknown (e.g. the access token expired; Claude Code
+# refreshes it on launch). Only one window fetches at a time; the rest reuse
+# the cache. The cache holds "<percent> <fetched at>"; its mtime only schedules
+# the next fetch. A failed fetch (e.g. HTTP 429) keeps the last value and waits
+# $BACKOFF seconds, so windows sharing a rate-limited account don't keep hitting
+# the endpoint. A value over 10 minutes old counts as unknown.
 usage() {
-  local cache="$ACC/usage.$1"
-  if [[ -z "$(find "$cache" -maxdepth 0 -newermt "-$POLL seconds" 2>/dev/null)" ]]; then
-    local tmp="$cache.$BASHPID.tmp"
-    python3 -I - "$HOME/.claude-$1/.credentials.json" > "$tmp" <<'PY' 2>/dev/null
-import json, sys, urllib.request
-tok = json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"]
-req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
-    "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"})
-d = json.load(urllib.request.urlopen(req, timeout=15))
-print(int(max((d.get(k) or {}).get("utilization") or 0 for k in ("five_hour", "seven_day"))))
+  local cache="$ACC/used.$1" lock="$ACC/used.$1.lock" v at
+  if [[ -z "$(find "$cache" -maxdepth 0 -newermt "-$POLL seconds" 2>/dev/null)" ]] \
+     && { mkdir "$lock" 2>/dev/null \
+          || { [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]] \
+               && rm -rf "$lock" && mkdir "$lock" 2>/dev/null; }; }; then
+    python3 -I - "$HOME/.claude-$1/.credentials.json" "$cache" "$POLL" "$BACKOFF" <<'PY' 2>/dev/null
+import json, os, sys, time, urllib.request
+cache, poll, backoff = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+now = time.time()
+try:
+    tok = json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"]
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"})
+    d = json.load(urllib.request.urlopen(req, timeout=15))
+    # The 5-hour and 7-day meters, every row of limits[] that isn't tied to one
+    # model, and the row the server itself headlines.
+    pct = [(d.get(k) or {}).get("utilization") or 0 for k in ("five_hour", "seven_day")]
+    pct += [r.get("percent") or 0 for r in d.get("limits") or []
+            if r.get("is_active") or not ((r.get("scope") or {}).get("model"))]
+    line, due = "%d %d\n" % (max(pct), now), now
+except Exception:
+    try: line = open(cache).read()
+    except OSError: line = ""
+    due = now + backoff - poll
+tmp = "%s.%d.tmp" % (cache, os.getpid())
+with open(tmp, "w") as f: f.write(line)
+os.utime(tmp, (due, due))
+os.replace(tmp, cache)
 PY
-    mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp"
+    rmdir "$lock" 2>/dev/null
   fi
-  cat "$cache" 2>/dev/null
+  read -r v at < "$cache" 2>/dev/null || return 0
+  [[ "$v" =~ ^[0-9]+$ && "$at" =~ ^[0-9]+$ ]] && (( $(date +%s) - at < 600 )) && echo "$v"
 }
 
 has_room() {
@@ -83,8 +107,16 @@ launch() {
 }
 
 # Next logged-in profile after $1 with usage below the switch threshold.
+# Accounts are used one at a time: prefer the one the other windows moved to
+# (the shared last-used profile), so windows don't drift onto different
+# accounts and drain several at once.
 next_profile() {
   local cur="$1" i n
+  n="$(cat "$STATE" 2>/dev/null)"
+  if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= COUNT && n != cur )) \
+     && logged_in "$n" && has_room "$n"; then
+    echo "$n"; return 0
+  fi
   for (( i = 1; i < COUNT; i++ )); do
     n=$(( (cur + i - 1) % COUNT + 1 ))
     if logged_in "$n" && has_room "$n"; then echo "$n"; return 0; fi
