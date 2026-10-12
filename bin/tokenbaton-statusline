@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# Status line command that tokenbaton passes to Claude Code with --settings.
+# Claude Code hands it the rate limits it read from the headers of its latest
+# API response; they're saved for tokenbaton as
+#   $TOKENBATON_HOME/live.<profile>: <5h %> <5h reset> <7d %> <7d reset> <saved at>
+# The status line itself comes from your own statusLine command if settings.json
+# has one, otherwise it shows the account and its usage.
+import json, os, re, subprocess, sys, time
+
+raw = sys.stdin.read()
+cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+m = re.search(r"-(\d+)/?$", cfg)
+profile = m.group(1) if m else None
+try:
+    rl = json.loads(raw).get("rate_limits") or {}
+except ValueError:
+    rl = {}
+
+def window(k):
+    w = rl.get(k) or {}
+    return round(w.get("used_percentage") or 0), int(w.get("resets_at") or 0)
+
+p5, r5 = window("five_hour")
+p7, r7 = window("seven_day")
+if profile and rl:
+    acc = os.environ.get("TOKENBATON_HOME") or os.path.expanduser("~/.tokenbaton")
+    path = os.path.join(acc, "live." + profile)
+    try:
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w") as f:
+            f.write("%d %d %d %d %d\n" % (p5, r5, p7, r7, time.time()))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+own = None
+try:
+    own = (json.load(open(os.path.join(cfg, "settings.json"))).get("statusLine") or {}).get("command")
+except (OSError, ValueError, AttributeError):
+    pass
+if own and "tokenbaton-statusline" not in own:
+    try:
+        r = subprocess.run(own, shell=True, input=raw, capture_output=True, text=True, timeout=10)
+        sys.stdout.write(r.stdout)
+    except (OSError, subprocess.SubprocessError):
+        pass
+elif profile:
+    parts = ["account " + profile]
+    if rl.get("five_hour"):
+        parts.append("5h %d%%" % p5)
+    if rl.get("seven_day"):
+        parts.append("7d %d%%" % p7)
+    print(" · ".join(parts))

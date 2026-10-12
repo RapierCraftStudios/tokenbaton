@@ -14,8 +14,12 @@ COUNT="${TOKENBATON_PROFILES:-5}"
 SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
 POLL=60
 BACKOFF=300   # after a failed usage check (e.g. HTTP 429), wait this long
+LIVE=300      # status-line usage newer than this is used without asking the endpoint
 ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
 PROFILE_CMD="$(dirname "$(readlink -f "$0")")/tokenbaton-profile"
+# Claude Code's status line gets the rate limits from every API response; this
+# command saves them for usage() below (see tokenbaton-statusline).
+STATUSLINE="$(dirname "$(readlink -f "$0")")/tokenbaton-statusline"
 STATE="$ACC/current"
 TRACK="$ACC/go.$$.session"
 CUR="$ACC/go.$$.profile"
@@ -38,14 +42,14 @@ sys.exit(0 if o.get("refreshToken") and (not exp or exp / 1000 > time.time()) el
 PY
 }
 
-# Print a profile's usage percent, cached for $POLL seconds and shared by all
-# windows. Prints nothing if unknown (e.g. the access token expired; Claude Code
+# Print a profile's usage percent from the usage endpoint, cached for $POLL
+# seconds and shared by all windows. Prints nothing if unknown (e.g. the access token expired; Claude Code
 # refreshes it on launch). Only one window fetches at a time; the rest reuse
 # the cache. The cache holds "<percent> <fetched at>"; its mtime only schedules
 # the next fetch. A failed fetch (e.g. HTTP 429) keeps the last value and waits
 # $BACKOFF seconds, so windows sharing a rate-limited account don't keep hitting
 # the endpoint. A value over 10 minutes old counts as unknown.
-usage() {
+polled_usage() {
   local cache="$ACC/used.$1" lock="$ACC/used.$1.lock" v at
   if [[ -z "$(find "$cache" -maxdepth 0 -newermt "-$POLL seconds" 2>/dev/null)" ]] \
      && { mkdir "$lock" 2>/dev/null \
@@ -77,8 +81,32 @@ os.replace(tmp, cache)
 PY
     rmdir "$lock" 2>/dev/null
   fi
-  read -r v at < "$cache" 2>/dev/null || return 0
+  read -r v at 2>/dev/null < "$cache" || return 0
   [[ "$v" =~ ^[0-9]+$ && "$at" =~ ^[0-9]+$ ]] && (( $(date +%s) - at < 600 )) && echo "$v"
+}
+
+# Print a profile's usage percent and when it was saved, from what the status
+# line last saw on that account. A window whose reset time has passed counts as 0.
+live_usage() {
+  local p5 r5 p7 r7 at now u=0
+  read -r p5 r5 p7 r7 at 2>/dev/null < "$ACC/live.$1" || return 1
+  [[ "$p5$r5$p7$r7$at" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( r5 > now && p5 > u )) && u=$p5
+  (( r7 > now && p7 > u )) && u=$p7
+  echo "$u $at"
+}
+
+# Print a profile's usage percent: the status line's figure while a window on
+# that account has used it in the last $LIVE seconds; otherwise the higher of
+# that figure and the usage endpoint's (other machines and `claude -p` runs
+# use the account without a status line).
+usage() {
+  local live at u
+  read -r live at < <(live_usage "$1")
+  if [[ -n "$live" ]] && (( $(date +%s) - at < LIVE )); then echo "$live"; return 0; fi
+  u="$(polled_usage "$1")"
+  if [[ -n "$live" && ( -z "$u" || "$live" -gt "${u:-0}" ) ]]; then echo "$live"; else echo "$u"; fi
 }
 
 has_room() {
@@ -103,7 +131,7 @@ clear_stale_lock() {
 launch() {
   clear_stale_lock "$1"
   echo "$1" > "$CUR"
-  "$PROFILE_CMD" "$@"
+  "$PROFILE_CMD" "$1" --settings "{\"statusLine\":{\"type\":\"command\",\"command\":\"TOKENBATON_HOME='$ACC' '$STATUSLINE'\"}}" "${@:2}"
 }
 
 # Next logged-in profile after $1 with usage below the switch threshold.

@@ -24,7 +24,8 @@ Requirements: Linux or macOS, `bash` 4+, `python3`, and Claude Code (`claude` on
 
 ```sh
 git clone https://github.com/RapierCraftStudios/tokenbaton.git
-ln -s "$PWD/tokenbaton/bin/tokenbaton" "$PWD/tokenbaton/bin/tokenbaton-profile" ~/.local/bin/
+ln -s "$PWD/tokenbaton/bin/tokenbaton" "$PWD/tokenbaton/bin/tokenbaton-profile" \
+      "$PWD/tokenbaton/bin/tokenbaton-statusline" ~/.local/bin/
 ```
 
 ## Set up accounts
@@ -79,13 +80,20 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
   ("another Claude Code process is refreshing it").
 - **Stale locks:** before launching an account, tokenbaton removes a `~/.claude-N.lock`
   that's over a minute old if no process is running on that account.
-- **Usage:** each window checks its account's usage about once a minute. The result is
-  cached for all windows, and only one window fetches it at a time. It's the highest of
-  the 5-hour and weekly meters and any other limit that isn't tied to a single model.
-  The usage endpoint rate-limits busy accounts (HTTP 429): after a failed check the last
-  value is kept and the next check waits five minutes. When usage can't be read, a
-  usage-limit error in the conversation, from the current Claude process and not yet
-  reset, also counts as the account being full.
+- **Usage:** Claude Code reads the account's usage from the headers of every API
+  response and hands it to its status line. tokenbaton launches Claude with a status
+  line command (`tokenbaton-statusline`, passed with `--settings`, so your settings file
+  isn't touched) that saves those figures per account and shows
+  `account N · 5h X% · 7d Y%`. If your settings have their own `statusLine`, that runs
+  instead and its output is shown. A usage window whose reset time has passed counts
+  as 0.
+- **Fallback:** when no window has used an account in the last five minutes (other
+  machines and `claude -p` runs don't report through a status line), tokenbaton also asks
+  the usage endpoint `/usage` uses and takes the higher figure. Only one window asks at
+  a time; it counts every limit not tied to a single model, and after a failure (the
+  endpoint rate-limits busy accounts with HTTP 429) it keeps the last value and waits five
+  minutes. If usage still can't be read, a usage-limit error in the conversation, from
+  the current Claude process and not yet reset, counts as the account being full.
 - **Idle detection:** the session's live state comes from Claude Code's
   `sessions/<pid>.json`, and tokenbaton only switches while it says `idle`, or
   `shell` (idle, with background tasks such as `claude -p` workers still running).
@@ -94,8 +102,10 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
 
 ## Caveats
 
-- Usage is read from the same endpoint Claude Code's `/usage` uses. It isn't a
-  documented public API and may change. If it can't be read, auto-switch just doesn't fire.
+- The usage endpoint isn't a documented public API and may change; the status line
+  figures come from Claude Code itself.
+- tokenbaton's `--settings` status line takes precedence over a `statusLine` set in a
+  project's `.claude/settings.json`; one in your user settings is still run.
 - A message you're halfway through typing when a switch happens is lost.
 - Only use accounts you're entitled to use, and make sure your setup complies with
   Anthropic's terms and your organisation's policies.
