@@ -76,7 +76,9 @@ clear_stale_lock() {
 launch() {
   clear_stale_lock "$1"
   echo "$1" > "$CUR"
-  "$PROFILE_CMD" "$@"
+  # Claude keeps its stderr (fd 3); bash's own "Killed" notice after an
+  # auto-switch goes to /dev/null.
+  { "$PROFILE_CMD" "$@" 2>&3; } 3>&2 2>/dev/null
 }
 
 # Next logged-in profile after $1 with usage below the switch threshold.
@@ -113,11 +115,31 @@ hit_limit() {
     | grep -q '"error":"rate_limit"'
 }
 
+# True if conversation $1 was refused for a usage limit by the Claude process
+# that started at $2 (epoch ms), and that limit hasn't reset yet. Used when the
+# usage endpoint itself is rate-limited (HTTP 429) and can't say the account is
+# full. The start-time check skips an error left over from an earlier account.
+limited_since() {
+  local f
+  f="$(ls -t "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)"
+  [[ -n "$f" && -n "$2" ]] || return 1
+  tail -n 300 "$f" | grep '"type":"assistant"' | tail -1 | python3 -I -c '
+import json, sys, time
+from datetime import datetime
+e = json.loads(sys.stdin.read())
+assert e.get("error") == "rate_limit"
+ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+reset = (e.get("quotaLimits") or {}).get("resetsAt")
+assert ts * 1000 >= int(sys.argv[1]) and (not reset or reset > time.time())
+' "$2" 2>/dev/null
+}
+
 # Record the sessionId of whichever claude process is our direct child, and
-# leave its pid and status ("idle", "busy", ...) in $child / $status.
+# leave its pid, start time (epoch ms) and status ("idle", "busy", ...) in
+# $child / $started / $status.
 snapshot() {
   local f pid sid
-  child=""; status=""
+  child=""; status=""; started=""
   for f in "$HOME"/.claude-[0-9]*/sessions/*.json; do
     [[ -e "$f" ]] || continue
     pid="${f##*/}"; pid="${pid%.json}"
@@ -125,21 +147,42 @@ snapshot() {
     sid="$(grep -o '"sessionId":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
     [[ -n "$sid" ]] && echo "$sid" > "$TRACK"
     child="$pid"
+    started="$(grep -o '"startedAt":[0-9]*' "$f" | head -1 | cut -d: -f2)"
     status="$(grep -o '"status":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
   done
 }
 
 # Close an idle Claude whose account is at the threshold, if another account
 # has room; the main loop then resumes the conversation there.
+# Claude Code reports "shell" instead of "idle" while background Bash tasks are
+# running (e.g. `claude -p` workers). On a normal exit it kills those tasks, so
+# in that state it gets SIGKILL instead, which skips its cleanup and leaves the
+# tasks running.
 maybe_switch() {
-  local p u
-  (( SWITCH_AT > 0 )) && [[ -n "$child" && "$status" == idle && ! -e "$AUTO" ]] || return 0
+  local p u sig=TERM
+  (( SWITCH_AT > 0 )) && [[ -n "$child" && ! -e "$AUTO" ]] || return 0
+  case "$status" in idle) ;; shell) sig=KILL ;; *) return 0 ;; esac
   p="$(cat "$CUR" 2>/dev/null)"; [[ -n "$p" ]] || return 0
-  u="$(usage "$p")"; [[ -n "$u" ]] && (( u >= SWITCH_AT )) || return 0
+  u="$(usage "$p")"
+  if [[ -z "$u" ]] || (( u < SWITCH_AT )); then
+    limited_since "$(resolve_session "$(cat "$TRACK" 2>/dev/null)")" "$started" || return 0
+    u=100
+  fi
   next_profile "$p" > /dev/null || return 0
-  echo "$p $u" > "$AUTO"
-  kill -TERM "$child" 2>/dev/null
+  # The usage checks above can take seconds; don't kill a turn that began meanwhile.
+  local c="$child" s="$status"; snapshot
+  [[ "$child" == "$c" && "$status" == "$s" ]] || return 0
+  echo "$p $u $sig" > "$AUTO"
+  kill "-$sig" "$child" 2>/dev/null
 }
+
+# Put the terminal back after a Claude that was killed without its own cleanup:
+# leave the alternate screen, show the cursor, turn off mouse tracking, bracketed
+# paste and enhanced keyboard modes, and restore line editing.
+reset_tty() {
+  printf '\e[?1049l\e[?25h\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?2004l\e[<u\e[>4;0m' > /dev/tty
+  stty sane < /dev/tty
+} 2>/dev/null
 
 watch() {
   local t=0
@@ -176,7 +219,8 @@ while true; do
   echo >&2
   auto=""
   if [[ -e "$AUTO" ]]; then
-    auto=1; read -r p u < "$AUTO"; rm -f "$AUTO"
+    auto=1; read -r p u sig < "$AUTO"; rm -f "$AUTO"
+    [[ "$sig" == KILL ]] && reset_tty
     echo "tokenbaton: account $p is at ${u}% usage; switching ${session:0:8} automatically" >&2
   else
     read -r -p "tokenbaton: [Enter] continue ${session:0:8} on next account, q to quit: " ans || break

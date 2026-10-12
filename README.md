@@ -51,7 +51,7 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
 
 - **Auto-switch:** once the session (5-hour) or weekly usage reaches the threshold
   and Claude is idle, the conversation moves to the next account that has room.
-  A turn that is still running is never interrupted.
+  A turn that is still running is never interrupted; background tasks are left running.
 - **Manual switch:** type `/exit`, then press Enter at the `tokenbaton:` prompt. Type `q` to quit.
 - **Follows you around:** if you `/resume` or `/clear` inside Claude Code, tokenbaton
   moves on with the conversation you're in now.
@@ -75,9 +75,15 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
 - **Stale locks:** before launching an account, tokenbaton removes a `~/.claude-N.lock`
   that's over a minute old if no process is running on that account.
 - **Usage:** each window checks its account's usage about once a minute. The result is
-  cached for all windows.
+  cached for all windows. The usage endpoint rate-limits busy accounts (HTTP 429); when
+  it can't be read, a usage-limit error in the conversation, from the current Claude
+  process and not yet reset, also counts as the account being full.
 - **Idle detection:** the session's live state comes from Claude Code's
-  `sessions/<pid>.json`, and tokenbaton only switches while it says `idle`.
+  `sessions/<pid>.json`, and tokenbaton only switches while it says `idle`, or
+  `shell` (idle, with background tasks such as `claude -p` workers still running).
+  In the `shell` case Claude is stopped with SIGKILL, because a normal exit kills
+  its background tasks; they keep running, but the resumed conversation won't get
+  their "task finished" notifications.
 
 ## Caveats
 
