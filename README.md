@@ -51,7 +51,9 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
 
 - **Auto-switch:** once the session (5-hour) or weekly usage reaches the threshold
   and Claude is idle, the conversation moves to the next account that has room.
-  A turn that is still running is never interrupted; background tasks are left running.
+  A turn that is still running is never interrupted. Background tasks Claude started
+  (e.g. `claude -p` workers) are stopped, and the conversation is asked to restart
+  the ones it still needs.
 - **Manual switch:** type `/exit`, then press Enter at the `tokenbaton:` prompt. Type `q` to quit.
 - **Follows you around:** if you `/resume` or `/clear` inside Claude Code, tokenbaton
   moves on with the conversation you're in now.
@@ -81,9 +83,8 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
 - **Idle detection:** the session's live state comes from Claude Code's
   `sessions/<pid>.json`, and tokenbaton only switches while it says `idle`, or
   `shell` (idle, with background tasks such as `claude -p` workers still running).
-  In the `shell` case Claude is stopped with SIGKILL, because a normal exit kills
-  its background tasks; they keep running, but the resumed conversation won't get
-  their "task finished" notifications.
+  In the `shell` case every process Claude started is stopped along with it, since the
+  resumed conversation couldn't track them anyway.
 
 ## Caveats
 

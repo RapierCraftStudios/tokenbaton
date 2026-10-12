@@ -19,6 +19,9 @@ STATE="$ACC/current"
 TRACK="$ACC/go.$$.session"
 CUR="$ACC/go.$$.profile"
 AUTO="$ACC/go.$$.auto"
+TASKS_MSG="tokenbaton moved this conversation to another account because the last one \
+reached its usage limit. Background tasks that were still running were stopped. \
+Check how far they got, restart the ones still needed, and continue."
 mkdir -p "$ACC"
 
 # A profile is usable if it has a refresh token that hasn't expired. Read the
@@ -76,9 +79,7 @@ clear_stale_lock() {
 launch() {
   clear_stale_lock "$1"
   echo "$1" > "$CUR"
-  # Claude keeps its stderr (fd 3); bash's own "Killed" notice after an
-  # auto-switch goes to /dev/null.
-  { "$PROFILE_CMD" "$@" 2>&3; } 3>&2 2>/dev/null
+  "$PROFILE_CMD" "$@"
 }
 
 # Next logged-in profile after $1 with usage below the switch threshold.
@@ -155,13 +156,12 @@ snapshot() {
 # Close an idle Claude whose account is at the threshold, if another account
 # has room; the main loop then resumes the conversation there.
 # Claude Code reports "shell" instead of "idle" while background Bash tasks are
-# running (e.g. `claude -p` workers). On a normal exit it kills those tasks, so
-# in that state it gets SIGKILL instead, which skips its cleanup and leaves the
-# tasks running.
+# running (e.g. `claude -p` workers). Those are stopped too, so nothing keeps
+# running that the resumed conversation can't track; it is asked to restart them.
 maybe_switch() {
-  local p u sig=TERM
+  local p u
   (( SWITCH_AT > 0 )) && [[ -n "$child" && ! -e "$AUTO" ]] || return 0
-  case "$status" in idle) ;; shell) sig=KILL ;; *) return 0 ;; esac
+  [[ "$status" == idle || "$status" == shell ]] || return 0
   p="$(cat "$CUR" 2>/dev/null)"; [[ -n "$p" ]] || return 0
   u="$(usage "$p")"
   if [[ -z "$u" ]] || (( u < SWITCH_AT )); then
@@ -172,17 +172,31 @@ maybe_switch() {
   # The usage checks above can take seconds; don't kill a turn that began meanwhile.
   local c="$child" s="$status"; snapshot
   [[ "$child" == "$c" && "$status" == "$s" ]] || return 0
-  echo "$p $u $sig" > "$AUTO"
-  kill "-$sig" "$child" 2>/dev/null
+  echo "$p $u $status" > "$AUTO"
+  stop_tree "$child"
 }
 
-# Put the terminal back after a Claude that was killed without its own cleanup:
-# leave the alternate screen, show the cursor, turn off mouse tracking, bracketed
-# paste and enhanced keyboard modes, and restore line editing.
-reset_tty() {
-  printf '\e[?1049l\e[?25h\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?2004l\e[<u\e[>4;0m' > /dev/tty
-  stty sane < /dev/tty
-} 2>/dev/null
+# Print every process descended from $1.
+descendants() {
+  ps -e -o pid= -o ppid= | awk -v root="$1" '
+    { kids[$2] = kids[$2] " " $1 }
+    END { q = root; while (q != "") { split(q, a, " "); q = ""
+            for (i in a) { n = split(kids[a[i]], k, " ")
+              for (j = 1; j <= n; j++) { print k[j]; q = q " " k[j] } } } }'
+}
+
+# Stop Claude ($1) normally, then anything it had started that outlived it
+# (background tasks can sit in their own process groups and sessions).
+stop_tree() {
+  local tree i
+  tree="$(descendants "$1")"
+  kill -TERM "$1" 2>/dev/null
+  for (( i = 0; i < 20; i++ )); do kill -0 "$1" 2>/dev/null || break; sleep 0.5; done
+  [[ -n "$tree" ]] || return 0
+  kill -TERM $tree 2>/dev/null
+  for (( i = 0; i < 10; i++ )); do kill -0 $tree 2>/dev/null || return 0; sleep 0.5; done
+  kill -KILL $tree 2>/dev/null
+}
 
 watch() {
   local t=0
@@ -217,10 +231,9 @@ while true; do
   session="$(cat "$TRACK" 2>/dev/null || true)"
   [[ -n "$session" ]] && session="$(resolve_session "$session" || true)"
   echo >&2
-  auto=""
+  auto=""; was=""
   if [[ -e "$AUTO" ]]; then
-    auto=1; read -r p u sig < "$AUTO"; rm -f "$AUTO"
-    [[ "$sig" == KILL ]] && reset_tty
+    auto=1; read -r p u was < "$AUTO"; rm -f "$AUTO"
     echo "tokenbaton: account $p is at ${u}% usage; switching ${session:0:8} automatically" >&2
   else
     read -r -p "tokenbaton: [Enter] continue ${session:0:8} on next account, q to quit: " ans || break
@@ -231,7 +244,9 @@ while true; do
     continue
   fi
   profile="$next"
-  if [[ -n "$session" && -n "$auto" ]] && hit_limit "$session"; then
+  if [[ -n "$session" && "$was" == shell ]]; then
+    launch "$profile" --resume "$session" "$TASKS_MSG"
+  elif [[ -n "$session" && -n "$auto" ]] && hit_limit "$session"; then
     launch "$profile" --resume "$session" "continue"
   elif [[ -n "$session" ]]; then
     launch "$profile" --resume "$session"
