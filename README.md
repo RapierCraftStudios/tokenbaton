@@ -25,7 +25,7 @@ Requirements: Linux or macOS, `bash` 4+, `python3`, and Claude Code (`claude` on
 ```sh
 git clone https://github.com/RapierCraftStudios/tokenbaton.git
 ln -s "$PWD/tokenbaton/bin/tokenbaton" "$PWD/tokenbaton/bin/tokenbaton-profile" \
-      "$PWD/tokenbaton/bin/tokenbaton-statusline" ~/.local/bin/
+      "$PWD/tokenbaton/bin/tokenbaton-statusline" "$PWD/tokenbaton/bin/tokenbaton-exec" ~/.local/bin/
 ```
 
 ## Set up accounts
@@ -62,6 +62,30 @@ tokenbaton 2 --resume ID   # any other arguments go straight to claude
   windows moved to, if it has room, so accounts are used up one after another
   rather than all at once.
 - **Every account full:** tokenbaton stays where it is and offers the manual prompt.
+
+## Headless runs
+
+Background tools that start `claude` themselves (`claude -p` scripts, CI helpers,
+agent orchestrators) don't go through a `tokenbaton` window, so they stay on whatever
+`CLAUDE_CONFIG_DIR` they were started with and stall when that account runs out.
+`tokenbaton-exec` picks the account with the most room **each time it starts**, so a
+long-running orchestrator spreads its workers over every account that has room:
+
+```sh
+tokenbaton --pick                      # print the account with the most room right now
+tokenbaton-exec -p "summarise CHANGELOG.md"   # run one headless command on it
+
+# Make every `claude` a tool starts go through tokenbaton-exec:
+mkdir -p ~/.tokenbaton/shim && ln -sf "$(command -v tokenbaton-exec)" ~/.tokenbaton/shim/claude
+env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
+```
+
+- The pick uses the same login check and usage figures as the windows (status-line
+  data, falling back to the shared usage endpoint), covering both the 5-hour and the
+  weekly limit.
+- Only accounts below `TOKENBATON_SWITCH_AT` are picked. For workers that run for a
+  long time, a lower threshold (e.g. `TOKENBATON_SWITCH_AT=90`) leaves headroom.
+- If no account has room, the command still runs, on the profile it was started with.
 
 ## Configuration
 

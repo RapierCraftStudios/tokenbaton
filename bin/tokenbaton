@@ -9,6 +9,7 @@
 # the conversation resumes on the next account with room, without prompting.
 # Set TOKENBATON_SWITCH_AT=0 to turn this off. Manual switch: /exit, Enter.
 #   tokenbaton [N] [claude args...]   (N = starting profile; default: last used)
+#   tokenbaton --pick                  print the account with the most room right now
 set -uo pipefail
 COUNT="${TOKENBATON_PROFILES:-5}"
 SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
@@ -274,6 +275,20 @@ watcher=$!
 trap 'kill "$watcher" 2>/dev/null; rm -f "$TRACK" "$CUR" "$AUTO"' EXIT
 
 profile="$(cat "$STATE" 2>/dev/null || echo 1)"
+# --pick: print the logged-in profile with the most room (lowest usage below the
+# switch threshold) and exit. Headless runs use it through tokenbaton-exec.
+if [[ "${1:-}" == "--pick" ]]; then
+  best="" best_u=101
+  for (( n = 1; n <= COUNT; n++ )); do
+    logged_in "$n" && has_room "$n" || continue
+    u="$(usage "$n")"; u="${u:-0}"
+    if (( u < best_u )); then best="$n"; best_u="$u"; fi
+  done
+  [[ -n "$best" ]] || { echo "tokenbaton: no logged-in account has room" >&2; exit 1; }
+  echo "$best"
+  exit 0
+fi
+
 if [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= COUNT )); then profile="$1"; shift; fi
 [[ "$profile" =~ ^[0-9]+$ ]] && (( profile >= 1 && profile <= COUNT )) || profile=1
 

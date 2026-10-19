@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run Claude Code headless (`claude -p`, or a tool that spawns `claude` itself) on
+# the logged-in account with the most room right now. Every invocation picks again,
+# so long-running orchestrators spread their workers over the accounts instead of
+# draining the one they were started on.
+#   tokenbaton-exec [claude args...]
+# Symlink it as `claude` in a directory placed first on a tool's PATH to make
+# every `claude` the tool starts go through it.
+set -uo pipefail
+self="$(readlink -f "$0")"
+here="$(dirname "$self")"
+
+# The real claude: the first one on PATH that isn't this script.
+real=""
+IFS=: read -ra dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+  c="$d/claude"
+  [[ -x "$c" ]] || continue
+  [[ "$(readlink -f "$c")" == "$self" ]] && continue
+  real="$c"; break
+done
+[[ -n "$real" ]] || { echo "tokenbaton-exec: claude not found on PATH" >&2; exit 127; }
+
+if n="$("$here/tokenbaton" --pick 2>/dev/null)"; then
+  export CLAUDE_CONFIG_DIR="$HOME/.claude-$n"
+else
+  echo "tokenbaton-exec: no account has room; running on ${CLAUDE_CONFIG_DIR:-the default profile}" >&2
+fi
+exec "$real" "$@"
