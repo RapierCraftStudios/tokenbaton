@@ -25,10 +25,34 @@ STATE="$ACC/current"
 TRACK="$ACC/go.$$.session"
 CUR="$ACC/go.$$.profile"
 AUTO="$ACC/go.$$.auto"
+STARTED_F="$ACC/go.$$.started"   # epoch ms of the newest claude process the watcher saw
+SINCE_F="$ACC/go.$$.since"       # mtime marker for resolve_session's search bound
+T0=${EPOCHSECONDS:-$(date +%s)}               # no transcript this window wrote can be older than this
 TASKS_MSG="tokenbaton moved this conversation to another account because the last one \
 reached its usage limit. Background tasks that were still running were stopped. \
 Check how far they got, restart the ones still needed, and continue."
 mkdir -p "$ACC"
+
+# The watcher sleeps every second in every window; use bash's loadable sleep
+# builtin when available so that doesn't fork/exec /usr/bin/sleep each time.
+enable -f /usr/lib/bash/sleep sleep 2>/dev/null || true
+
+# Drop per-window files left by windows that died without running their trap
+# (killed, crashed, power loss), and status-line temp files from interrupted writes.
+for f in "$ACC"/go.*.*; do
+  [[ -e "$f" ]] || continue
+  pid="${f#"$ACC"/go.}"; pid="${pid%%.*}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || continue
+  if [[ -d /proc/self ]]; then
+    # Check the command line too, so a reused pid doesn't keep a dead window's files.
+    c="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+    [[ "$c" == *tokenbaton* || "$c" == *"${0##*/}"* ]] || rm -f "$f"
+  else
+    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  fi
+done
+find "$ACC" -maxdepth 1 -name 'live.*.tmp' -mmin +10 -exec rm -f {} + 2>/dev/null
+unset f pid c
 
 # A profile is usable if it has a refresh token that hasn't expired. Read the
 # file directly: `claude auth status` grabs the refresh lock on an expired
@@ -156,13 +180,23 @@ next_profile() {
 # Map an ID to a saved conversation. If no transcript has that name (the window
 # was launched with an ID, then moved to another chat via /resume), use the
 # newest transcript whose entries were written by a process with that ID.
+# $2 (optional) is the start time (epoch ms) of the Claude process: a transcript
+# that process wrote was modified after it started, so only those are searched
+# (the projects tree is many GB). Without it, the start of this claude-go run
+# is the bound, since every process it launched started after that.
 resolve_session() {
-  local id="$1" f
+  local id="$1" since="${2:-}" f
+  [[ -n "$id" ]] || return 1
   for f in "$HOME"/.claude/projects/*/"$id".jsonl; do
     [[ -e "$f" ]] && { echo "$id"; return 0; }
   done
-  f="$(grep -l --include='*.jsonl' -r "\"session_id\":\"$id\"" "$HOME/.claude/projects" 2>/dev/null \
-       | grep -v '/subagents/' | xargs -r ls -t 2>/dev/null | head -1)"
+  [[ "$since" =~ ^[0-9]+$ ]] && since=$(( since / 1000 )) || since=$T0
+  # `find -newer` a marker file stamped with the bound (portable; -newermt is GNU-only).
+  touch -t "$(printf '%(%Y%m%d%H%M.%S)T' "$(( since - 5 ))")" "$SINCE_F" 2>/dev/null || return 1
+  f="$(find -H "$HOME/.claude/projects" -name '*.jsonl' -not -path '*/subagents/*' \
+         -newer "$SINCE_F" -print0 2>/dev/null \
+       | xargs -0 -r grep -l -F "\"session_id\":\"$id\"" 2>/dev/null \
+       | xargs -r ls -t 2>/dev/null | head -1)"
   [[ -n "$f" ]] || return 1
   f="${f##*/}"; echo "${f%.jsonl}"
 }
@@ -185,7 +219,10 @@ limited_since() {
   local f
   f="$(ls -t "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)"
   [[ -n "$f" && -n "$2" ]] || return 1
-  tail -n 300 "$f" | grep '"type":"assistant"' | tail -1 | python3 -I -c '
+  local last
+  last="$(tail -n 300 "$f" | grep '"type":"assistant"' | tail -1)"
+  [[ "$last" == *'"error":"rate_limit"'* ]] || return 1   # skip python unless it can match
+  printf '%s\n' "$last" | python3 -I -c '
 import json, sys, time
 from datetime import datetime
 e = json.loads(sys.stdin.read())
@@ -200,18 +237,31 @@ assert ts * 1000 >= int(sys.argv[1]) and (not reset or reset > time.time())
 # leave its pid, start time (epoch ms) and status ("idle", "busy", ...) in
 # $child / $started / $status.
 snapshot() {
-  local f pid sid
+  local f pid sid st c
   child=""; status=""; started=""
   for f in "$HOME"/.claude-[0-9]*/sessions/*.json; do
     [[ -e "$f" ]] || continue
     pid="${f##*/}"; pid="${pid%.json}"
-    [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" == "$$" ]] || continue
-    sid="$(grep -o '"sessionId":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
-    [[ -n "$sid" ]] && echo "$sid" > "$TRACK"
+    # Parent pid from /proc without forking (the 4th stat field, after "(comm) state");
+    # ps where there is no /proc (macOS).
+    if [[ -d /proc/self ]]; then
+      read -r st 2>/dev/null < "/proc/$pid/stat" || continue
+      st="${st##*) }"; st="${st#* }"; st="${st%% *}"
+    else
+      st="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    fi
+    [[ "$st" == "$$" ]] || continue
+    { c="$(< "$f")"; } 2>/dev/null || continue
+    sid=""
+    [[ "$c" =~ \"sessionId\":\"([^\"]*)\" ]] && sid="${BASH_REMATCH[1]}"
+    if [[ -n "$sid" && "$sid" != "$last_sid" ]]; then echo "$sid" > "$TRACK"; last_sid="$sid"; fi
     child="$pid"
-    started="$(grep -o '"startedAt":[0-9]*' "$f" | head -1 | cut -d: -f2)"
-    status="$(grep -o '"status":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
+    started=""; [[ "$c" =~ \"startedAt\":([0-9]*) ]] && started="${BASH_REMATCH[1]}"
+    status=""; [[ "$c" =~ \"status\":\"([^\"]*)\" ]] && status="${BASH_REMATCH[1]}"
   done
+  if [[ -n "$started" && "$started" != "$last_started" ]]; then
+    echo "$started" > "$STARTED_F"; last_started="$started"
+  fi
 }
 
 # Close an idle Claude whose account is at the threshold, if another account
@@ -226,7 +276,7 @@ maybe_switch() {
   p="$(cat "$CUR" 2>/dev/null)"; [[ -n "$p" ]] || return 0
   u="$(usage "$p")"
   if [[ -z "$u" ]] || (( u < SWITCH_AT )); then
-    limited_since "$(resolve_session "$(cat "$TRACK" 2>/dev/null)")" "$started" || return 0
+    limited_since "$(resolve_session "$(< "$TRACK" 2>/dev/null)" "$started")" "$started" || return 0
     u=100
   fi
   next_profile "$p" > /dev/null || return 0
@@ -260,7 +310,7 @@ stop_tree() {
 }
 
 watch() {
-  local t=0
+  local t=0 last_sid="" last_started=""
   while kill -0 "$$" 2>/dev/null; do
     snapshot
     (( t++ % 15 == 0 )) && maybe_switch
@@ -272,7 +322,7 @@ watch() {
 # must never print there; anything it says goes to a log instead.
 watch > /dev/null 2>> "$ACC/go.log" &
 watcher=$!
-trap 'kill "$watcher" 2>/dev/null; rm -f "$TRACK" "$CUR" "$AUTO"' EXIT
+trap 'kill "$watcher" 2>/dev/null; rm -f "$TRACK" "$CUR" "$AUTO" "$STARTED_F" "$SINCE_F"' EXIT
 
 profile="$(cat "$STATE" 2>/dev/null || echo 1)"
 # --pick: print the logged-in profile with the most room (lowest usage below the
@@ -304,7 +354,7 @@ esac
 
 while true; do
   session="$(cat "$TRACK" 2>/dev/null || true)"
-  [[ -n "$session" ]] && session="$(resolve_session "$session" || true)"
+  [[ -n "$session" ]] && session="$(resolve_session "$session" "$(cat "$STARTED_F" 2>/dev/null)" || true)"
   echo >&2
   auto=""; was=""
   if [[ -e "$AUTO" ]]; then
