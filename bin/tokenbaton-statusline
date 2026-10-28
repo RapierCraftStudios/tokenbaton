@@ -33,11 +33,13 @@ if profile and rl:
     except OSError:
         pass
 
-own = None
-try:
-    own = (json.load(open(os.path.join(cfg, "settings.json"))).get("statusLine") or {}).get("command")
-except (OSError, ValueError, AttributeError):
-    pass
+# TOKENBATON_STATUSLINE (set by a wrapper such as forge) wins over settings.json.
+own = os.environ.get("TOKENBATON_STATUSLINE")
+if not own:
+    try:
+        own = (json.load(open(os.path.join(cfg, "settings.json"))).get("statusLine") or {}).get("command")
+    except (OSError, ValueError, AttributeError):
+        pass
 if own and "tokenbaton-statusline" not in own:
     try:
         r = subprocess.run(own, shell=True, input=raw, capture_output=True, text=True, timeout=10)
