@@ -14,6 +14,7 @@ set -uo pipefail
 COUNT="${TOKENBATON_PROFILES:-5}"
 SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
 POLL=60
+CHECK="${TOKENBATON_CHECK_EVERY:-15}"   # seconds between the watcher's usage checks
 BACKOFF=300   # after a failed usage check (e.g. HTTP 429), wait this long
 LIVE=300      # status-line usage newer than this is used without asking the endpoint
 ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
@@ -39,20 +40,25 @@ enable -f /usr/lib/bash/sleep sleep 2>/dev/null || true
 
 # Drop per-window files left by windows that died without running their trap
 # (killed, crashed, power loss), and status-line temp files from interrupted writes.
+# Only a dead pid's files go: matching the command line deleted the live state of
+# windows started under another name (e.g. a claude-go symlink), which turned
+# their auto-switch off. A reused pid's leftovers are cleared by that window below.
 for f in "$ACC"/go.*.*; do
   [[ -e "$f" ]] || continue
   pid="${f#"$ACC"/go.}"; pid="${pid%%.*}"
   [[ "$pid" =~ ^[0-9]+$ ]] || continue
-  if [[ -d /proc/self ]]; then
-    # Check the command line too, so a reused pid doesn't keep a dead window's files.
-    c="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
-    [[ "$c" == *tokenbaton* || "$c" == *"${0##*/}"* ]] || rm -f "$f"
-  else
-    kill -0 "$pid" 2>/dev/null || rm -f "$f"
-  fi
+  kill -0 "$pid" 2>/dev/null || [[ -d "/proc/$pid" ]] || rm -f "$f"
 done
+rm -f "$ACC"/go.$$.*
 find "$ACC" -maxdepth 1 -name 'live.*.tmp' -mmin +10 -exec rm -f {} + 2>/dev/null
-unset f pid c
+unset f pid
+
+# Write $2 to state file $1, quietly: a full disk or a removed $ACC must not
+# flood go.log. Recreates $ACC if it went away. Fails if the write didn't happen.
+put() {
+  { echo "$2" > "$1"; } 2>/dev/null && return 0
+  mkdir -p "$ACC" 2>/dev/null && { echo "$2" > "$1"; } 2>/dev/null
+}
 
 # A profile is usable if it has a refresh token that hasn't expired. Read the
 # file directly: `claude auth status` grabs the refresh lock on an expired
@@ -155,7 +161,7 @@ clear_stale_lock() {
 
 launch() {
   clear_stale_lock "$1"
-  echo "$1" > "$CUR"
+  put "$CUR" "$1"
   "$PROFILE_CMD" "$1" --settings "{\"statusLine\":{\"type\":\"command\",\"command\":\"TOKENBATON_HOME='$ACC' '$STATUSLINE'\"}}" "${@:2}"
 }
 
@@ -234,11 +240,14 @@ assert ts * 1000 >= int(sys.argv[1]) and (not reset or reset > time.time())
 }
 
 # Record the sessionId of whichever claude process is our direct child, and
-# leave its pid, start time (epoch ms) and status ("idle", "busy", ...) in
-# $child / $started / $status.
+# leave its pid, start time (epoch ms), status ("idle", "busy", ...), profile
+# and session in $child / $started / $status / $child_profile / $last_sid.
+# The profile comes from the folder the session record is in, so it is known
+# even when $CUR is missing. $TRACK and $STARTED_F are written again if they
+# disappear (another process removed them, or a write failed on a full disk).
 snapshot() {
   local f pid sid st c
-  child=""; status=""; started=""
+  child=""; status=""; started=""; child_profile=""
   for f in "$HOME"/.claude-[0-9]*/sessions/*.json; do
     [[ -e "$f" ]] || continue
     pid="${f##*/}"; pid="${pid%.json}"
@@ -254,13 +263,17 @@ snapshot() {
     { c="$(< "$f")"; } 2>/dev/null || continue
     sid=""
     [[ "$c" =~ \"sessionId\":\"([^\"]*)\" ]] && sid="${BASH_REMATCH[1]}"
-    if [[ -n "$sid" && "$sid" != "$last_sid" ]]; then echo "$sid" > "$TRACK"; last_sid="$sid"; fi
+    if [[ -n "$sid" && ( "$sid" != "$last_sid" || ! -s "$TRACK" ) ]]; then
+      put "$TRACK" "$sid"; last_sid="$sid"
+    fi
     child="$pid"
+    child_profile="${f%/sessions/*}"; child_profile="${child_profile##*/.claude-}"
+    [[ "$child_profile" =~ ^[0-9]+$ ]] || child_profile=""
     started=""; [[ "$c" =~ \"startedAt\":([0-9]*) ]] && started="${BASH_REMATCH[1]}"
     status=""; [[ "$c" =~ \"status\":\"([^\"]*)\" ]] && status="${BASH_REMATCH[1]}"
   done
-  if [[ -n "$started" && "$started" != "$last_started" ]]; then
-    echo "$started" > "$STARTED_F"; last_started="$started"
+  if [[ -n "$started" && ( "$started" != "$last_started" || ! -s "$STARTED_F" ) ]]; then
+    put "$STARTED_F" "$started"; last_started="$started"
   fi
 }
 
@@ -269,21 +282,27 @@ snapshot() {
 # Claude Code reports "shell" instead of "idle" while background Bash tasks are
 # running (e.g. `claude -p` workers). Those are stopped too, so nothing keeps
 # running that the resumed conversation can't track; it is asked to restart them.
+# No state file is required: the profile and session come from snapshot when
+# $CUR / $TRACK are gone, and the main window is told by signal (USR1 idle,
+# USR2 shell) as well as through $AUTO, so a failed write still switches.
 maybe_switch() {
-  local p u
+  local p u sid
   (( SWITCH_AT > 0 )) && [[ -n "$child" && ! -e "$AUTO" ]] || return 0
   [[ "$status" == idle || "$status" == shell ]] || return 0
-  p="$(cat "$CUR" 2>/dev/null)"; [[ -n "$p" ]] || return 0
+  p="$child_profile"; [[ -n "$p" ]] || p="$(cat "$CUR" 2>/dev/null)"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 0
   u="$(usage "$p")"
   if [[ -z "$u" ]] || (( u < SWITCH_AT )); then
-    limited_since "$(resolve_session "$(< "$TRACK" 2>/dev/null)" "$started")" "$started" || return 0
+    sid="$(cat "$TRACK" 2>/dev/null)"; sid="${sid:-$last_sid}"
+    limited_since "$(resolve_session "$sid" "$started")" "$started" || return 0
     u=100
   fi
   next_profile "$p" > /dev/null || return 0
   # The usage checks above can take seconds; don't kill a turn that began meanwhile.
   local c="$child" s="$status"; snapshot
   [[ "$child" == "$c" && "$status" == "$s" ]] || return 0
-  echo "$p $u $status" > "$AUTO"
+  put "$AUTO" "$p $u $status" || echo "tokenbaton: could not write $AUTO; signalling instead" >&2
+  if [[ "$status" == shell ]]; then kill -USR2 "$$"; else kill -USR1 "$$"; fi
   stop_tree "$child"
 }
 
@@ -310,10 +329,10 @@ stop_tree() {
 }
 
 watch() {
-  local t=0 last_sid="" last_started=""
+  local t=0 last_sid="" last_started="" child_profile=""
   while kill -0 "$$" 2>/dev/null; do
     snapshot
-    (( t++ % 15 == 0 )) && maybe_switch
+    (( t++ % CHECK == 0 )) && maybe_switch
     sleep 1
   done
 }
@@ -323,6 +342,10 @@ watch() {
 watch > /dev/null 2>> "$ACC/go.log" &
 watcher=$!
 trap 'kill "$watcher" 2>/dev/null; rm -f "$TRACK" "$CUR" "$AUTO" "$STARTED_F" "$SINCE_F"' EXIT
+# The watcher's auto-switch notice, for when it couldn't write $AUTO.
+signalled=""
+trap 'signalled=idle' USR1
+trap 'signalled=shell' USR2
 
 profile="$(cat "$STATE" 2>/dev/null || echo 1)"
 # --pick: print the logged-in profile with the most room (lowest usage below the
@@ -348,18 +371,23 @@ case " $* " in
     launch "$profile" "$@" ;;
   *)
     sid="$(cat /proc/sys/kernel/random/uuid)"
-    echo "$sid" > "$TRACK"
+    put "$TRACK" "$sid"
     launch "$profile" --session-id "$sid" "$@" ;;
 esac
 
+# The conversation last resumed, for when $TRACK is missing.
+known="${sid:-}"
 while true; do
-  session="$(cat "$TRACK" 2>/dev/null || true)"
-  [[ -n "$session" ]] && session="$(resolve_session "$session" "$(cat "$STARTED_F" 2>/dev/null)" || true)"
+  tracked="$(cat "$TRACK" 2>/dev/null || true)"; tracked="${tracked:-$known}"
+  session=""
+  [[ -n "$tracked" ]] && session="$(resolve_session "$tracked" "$(cat "$STARTED_F" 2>/dev/null)" || true)"
   echo >&2
-  auto=""; was=""
-  if [[ -e "$AUTO" ]]; then
-    auto=1; read -r p u was < "$AUTO"; rm -f "$AUTO"
-    echo "tokenbaton: account $p is at ${u}% usage; switching ${session:0:8} automatically" >&2
+  auto=""; was=""; p=""; u=""
+  if [[ -e "$AUTO" || -n "$signalled" ]]; then
+    auto=1; read -r p u was 2>/dev/null < "$AUTO"; rm -f "$AUTO"
+    was="${was:-$signalled}"; signalled=""
+    if [[ -n "$u" ]]; then u="${u}% usage"; else u="its usage limit"; fi
+    echo "tokenbaton: account ${p:-$profile} is at $u; switching ${session:0:8} automatically" >&2
   else
     read -r -p "tokenbaton: [Enter] continue ${session:0:8} on next account, q to quit: " ans || break
     [[ "$ans" == q* ]] && break
@@ -369,6 +397,7 @@ while true; do
     continue
   fi
   profile="$next"
+  [[ -n "$session" ]] && known="$session"
   if [[ -n "$session" && "$was" == shell ]]; then
     launch "$profile" --resume "$session" "$TASKS_MSG"
   elif [[ -n "$session" && -n "$auto" ]] && hit_limit "$session"; then

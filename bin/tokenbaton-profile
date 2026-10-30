@@ -56,7 +56,8 @@ for item in "${SHARED[@]}"; do
   fi
 done
 
-mkdir -p "$(dirname "$STATE")"
-echo "$n" > "$STATE"
+# The last-used profile is a hint for the next start; failing to save it (full
+# disk) must not stop this one.
+{ mkdir -p "$(dirname "$STATE")" && echo "$n" > "$STATE"; } 2>/dev/null || true
 echo "tokenbaton-profile: account $n ($dir)" >&2
 CLAUDE_CONFIG_DIR="$dir" exec claude "$@"
