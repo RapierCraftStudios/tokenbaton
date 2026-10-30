@@ -81,8 +81,8 @@ env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
 ```
 
 - The pick uses the same login check and usage figures as the windows (status-line
-  data, falling back to the shared usage endpoint), covering both the 5-hour and the
-  weekly limit.
+  data and the shared usage endpoint, whichever is higher), covering the 5-hour, the
+  weekly and every other account-wide limit.
 - Only accounts below `TOKENBATON_SWITCH_AT` are picked. For workers that run for a
   long time, a lower threshold (e.g. `TOKENBATON_SWITCH_AT=90`) leaves headroom.
 - If no account has room, the command still runs, on the profile it was started with.
@@ -111,10 +111,12 @@ env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
   `account N · 5h X% · 7d Y%`. If your settings have their own `statusLine`, that runs
   instead and its output is shown. A usage window whose reset time has passed counts
   as 0.
-- **Fallback:** when no window has used an account in the last five minutes (other
-  machines and `claude -p` runs don't report through a status line), tokenbaton also asks
-  the usage endpoint `/usage` uses and takes the higher figure. Only one window asks at
-  a time; it counts every limit not tied to a single model, and after a failure (the
+- **Endpoint:** the status line only sees the 5-hour and weekly windows, and other
+  machines and `claude -p` runs don't report through it, so tokenbaton also asks the
+  usage endpoint `/usage` uses, at most once a minute per account, and takes the higher
+  figure. A figure fetched before a reset the status line has since seen is ignored
+  until the next fetch. Only one window asks at a time; it counts every limit not tied
+  to a single model, and after a failure (the
   endpoint rate-limits busy accounts with HTTP 429) it keeps the last value and waits five
   minutes. If usage still can't be read, a usage-limit error in the conversation, from
   the current Claude process and not yet reset, counts as the account being full.

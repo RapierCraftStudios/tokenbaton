@@ -50,6 +50,10 @@ SH
   echo 1 > "$T/acc/current"
 }
 
+# Seed the usage endpoint's cache for account $1: "<percent> <fetched at>". Its
+# mtime is now, so tokenbaton reuses it instead of fetching.
+endpoint() { echo "$2 $3" > "$T/acc/used.$1"; }
+
 # Start a window on account 1 through $1 (tokenbaton or claude-go) and wait for
 # it to end: it ends after relaunching on account 2, or is stopped after $2 seconds.
 run() {
@@ -118,6 +122,35 @@ teardown
 
 ROOM2=100 setup; TB_RM=profile run tokenbaton 4
 check "no switch when no other account has room" "! grep -q '^2 ' '$T/launches'"
+teardown
+
+# Usage: the status line sees only the 5-hour and weekly windows. A fresh low
+# figure there must not hide another limit the endpoint reports as full.
+setup; now="$(date +%s)"; far=$(( now + 3600 ))
+echo "35 $far 0 $far $now" > "$T/acc/live.1"; endpoint 1 100 "$now"
+run tokenbaton
+check "endpoint at 100% wins over a fresh 35% status line: switches" switched
+teardown
+
+setup; now="$(date +%s)"; far=$(( now + 3600 ))
+echo "35 $far 0 $far $now" > "$T/acc/live.1"; endpoint 1 40 "$now"
+run tokenbaton 4
+check "both figures below the threshold: no switch" "! grep -q '^2 ' '$T/launches'"
+teardown
+
+# An endpoint figure fetched before a reset the status line has seen is stale:
+# account 2's 100% from before its reset must not block the switch to it.
+setup; now="$(date +%s)"
+echo "100 $(( now - 60 )) 0 0 $now" > "$T/acc/live.2"; endpoint 2 100 $(( now - 120 ))
+run tokenbaton
+check "endpoint figure from before a passed reset is ignored: switches" switched
+teardown
+
+# ...but one fetched after that reset still counts.
+setup; now="$(date +%s)"
+echo "100 $(( now - 60 )) 0 0 $now" > "$T/acc/live.2"; endpoint 2 100 $(( now - 30 ))
+run tokenbaton 4
+check "endpoint figure from after the reset still counts: no switch" "! grep -q '^2 ' '$T/launches'"
 teardown
 
 echo "$pass passed, $fail failed"

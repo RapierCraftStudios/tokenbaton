@@ -16,7 +16,6 @@ SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
 POLL=60
 CHECK="${TOKENBATON_CHECK_EVERY:-15}"   # seconds between the watcher's usage checks
 BACKOFF=300   # after a failed usage check (e.g. HTTP 429), wait this long
-LIVE=300      # status-line usage newer than this is used without asking the endpoint
 ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
 PROFILE_CMD="$(dirname "$(readlink -f "$0")")/tokenbaton-profile"
 # Claude Code's status line gets the rate limits from every API response; this
@@ -113,31 +112,36 @@ PY
     rmdir "$lock" 2>/dev/null
   fi
   read -r v at 2>/dev/null < "$cache" || return 0
-  [[ "$v" =~ ^[0-9]+$ && "$at" =~ ^[0-9]+$ ]] && (( $(date +%s) - at < 600 )) && echo "$v"
+  [[ "$v" =~ ^[0-9]+$ && "$at" =~ ^[0-9]+$ ]] && (( $(date +%s) - at < 600 )) && echo "$v $at"
 }
 
-# Print a profile's usage percent and when it was saved, from what the status
-# line last saw on that account. A window whose reset time has passed counts as 0.
+# Print a profile's usage percent, when it was saved, and when its latest
+# already-passed reset was (0 if none), from what the status line last saw on
+# that account. A window whose reset time has passed counts as 0.
 live_usage() {
-  local p5 r5 p7 r7 at now u=0
+  local p5 r5 p7 r7 at now u=0 reset=0
   read -r p5 r5 p7 r7 at 2>/dev/null < "$ACC/live.$1" || return 1
   [[ "$p5$r5$p7$r7$at" =~ ^[0-9]+$ ]] || return 1
   now="$(date +%s)"
   (( r5 > now && p5 > u )) && u=$p5
   (( r7 > now && p7 > u )) && u=$p7
-  echo "$u $at"
+  (( r5 <= now && r5 > reset )) && reset=$r5
+  (( r7 <= now && r7 > reset )) && reset=$r7
+  echo "$u $at $reset"
 }
 
-# Print a profile's usage percent: the status line's figure while a window on
-# that account has used it in the last $LIVE seconds; otherwise the higher of
-# that figure and the usage endpoint's (other machines and `claude -p` runs
-# use the account without a status line).
+# Print a profile's usage percent: the higher of the status line's figure and
+# the usage endpoint's. The status line only sees the 5-hour and 7-day windows,
+# so a fresh low figure there can hide another limit the endpoint reports as
+# full; other machines and `claude -p` runs also use the account without a
+# status line. An endpoint figure fetched before a reset the status line has
+# since seen pass is out of date, and is ignored until the next fetch.
 usage() {
-  local live at u
-  read -r live at < <(live_usage "$1")
-  if [[ -n "$live" ]] && (( $(date +%s) - at < LIVE )); then echo "$live"; return 0; fi
-  u="$(polled_usage "$1")"
-  if [[ -n "$live" && ( -z "$u" || "$live" -gt "${u:-0}" ) ]]; then echo "$live"; else echo "$u"; fi
+  local live at reset u pat
+  read -r live at reset < <(live_usage "$1")
+  read -r u pat < <(polled_usage "$1")
+  [[ -n "$u" && -n "$reset" ]] && (( pat < reset )) && u=""
+  if [[ -n "$live" && ( -z "$u" || "$live" -gt "$u" ) ]]; then echo "$live"; else echo "$u"; fi
 }
 
 has_room() {
