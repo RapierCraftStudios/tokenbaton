@@ -10,6 +10,7 @@
 # Set TOKENBATON_SWITCH_AT=0 to turn this off. Manual switch: /exit, Enter.
 #   tokenbaton [N] [claude args...]   (N = starting profile; default: last used)
 #   tokenbaton --pick                  print the account with the most room right now
+#   tokenbaton status | keepalive [--dry-run|--install|--uninstall] | login <N>|--new
 set -uo pipefail
 COUNT="${TOKENBATON_PROFILES:-5}"
 SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
@@ -32,6 +33,11 @@ TASKS_MSG="tokenbaton moved this conversation to another account because the las
 reached its usage limit. Background tasks that were still running were stopped. \
 Check how far they got, restart the ones still needed, and continue."
 mkdir -p "$ACC"
+
+# Account management subcommands (no Claude window): see tokenbaton-ctl.
+case "${1:-}" in
+  keepalive|login|status) exec "$(dirname "$(readlink -f "$0")")/tokenbaton-ctl" "$@" ;;
+esac
 
 # The watcher sleeps every second in every window; use bash's loadable sleep
 # builtin when available so that doesn't fork/exec /usr/bin/sleep each time.

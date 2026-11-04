@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""tokenbaton account management: keepalive, login, status.
+
+Reached through `tokenbaton keepalive|login|status`; never prints a token.
+
+  tokenbaton status
+  tokenbaton keepalive [--dry-run] | --install | --uninstall
+  tokenbaton login <N> | --new [claude auth login args...]
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+ACC = os.environ.get("TOKENBATON_HOME") or os.path.join(HOME, ".tokenbaton")
+COUNT = int(os.environ.get("TOKENBATON_PROFILES") or 5)
+KEEPALIVE_HOURS = float(os.environ.get("TOKENBATON_KEEPALIVE_HOURS") or 48)
+# proper-lockfile (what Claude Code uses) treats a lock whose mtime hasn't been
+# touched for ~10s as stale; a live holder keeps touching it.
+LOCK_SETTLE = float(os.environ.get("TOKENBATON_LOCK_SETTLE") or 15)
+LOCK_STALE = float(os.environ.get("TOKENBATON_LOCK_STALE") or 60)
+REFRESH_TIMEOUT = float(os.environ.get("TOKENBATON_REFRESH_TIMEOUT") or 90)
+SELF = os.path.realpath(__file__)
+BIN = os.path.dirname(SELF)
+UNIT = "tokenbaton-keepalive"
+LOG = os.path.join(ACC, "keepalive.log")
+
+
+# ---------------------------------------------------------------- profiles
+
+def pdir(n):
+    return os.path.join(HOME, ".claude-%d" % n)
+
+
+def profiles():
+    """Every existing numeric profile that has a login file."""
+    out = set(range(1, COUNT + 1))
+    for p in glob.glob(os.path.join(HOME, ".claude-[0-9]*")):
+        m = re.fullmatch(r".*/\.claude-(\d+)", p)
+        if m and os.path.isdir(p):
+            out.add(int(m.group(1)))
+    return sorted(out)
+
+
+def read_oauth(n):
+    try:
+        with open(os.path.join(pdir(n), ".credentials.json")) as f:
+            return json.load(f).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def email(n):
+    try:
+        with open(os.path.join(pdir(n), ".claude.json")) as f:
+            return (json.load(f).get("oauthAccount") or {}).get("emailAddress") or "?"
+    except (OSError, ValueError):
+        return "?"
+
+
+def secs(ms):
+    return ms / 1000.0 if isinstance(ms, (int, float)) and ms > 0 else None
+
+
+def usable(o, now):
+    rexp = secs(o.get("refreshTokenExpiresAt"))
+    return bool(o.get("refreshToken")) and (rexp is None or rexp > now)
+
+
+def rel(t, now):
+    """'in 3h12m' / '5h ago' / 'never'."""
+    if t is None:
+        return "-"
+    d = t - now
+    a = abs(d)
+    if a >= 86400:
+        s = "%dd%dh" % (a // 86400, a % 86400 // 3600)
+    elif a >= 3600:
+        s = "%dh%02dm" % (a // 3600, a % 3600 // 60)
+    else:
+        s = "%dm" % (a // 60)
+    return ("in " + s) if d > 0 else (s + " ago")
+
+
+def stamp(t):
+    return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(t)) if t else "-"
+
+
+def current():
+    try:
+        return int(open(os.path.join(ACC, "current")).read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ status
+
+def live(n, now):
+    """(5h cell, 7d cell) from live.N. A sample whose window already reset
+    shows the sampled figure with '*' and the reset as past: it's stale."""
+    try:
+        p5, r5, p7, r7, at = map(int, open(os.path.join(ACC, "live.%d" % n)).read().split())
+    except (OSError, ValueError):
+        return "-", "-"
+
+    def cell(p, r):
+        if r <= now:
+            return "0%% (was %d%%*)" % p if p else "0% (reset*)"
+        return "%d%% %s" % (p, rel(r, now))
+    return cell(p5, r5), cell(p7, r7)
+
+
+def cmd_status(args):
+    now = time.time()
+    cur = current()
+    rows = [("", "N", "EMAIL", "5H", "7D", "ACCESS", "REFRESH", "USABLE")]
+    for n in profiles():
+        o = read_oauth(n)
+        if not o and not os.path.isdir(pdir(n)):
+            continue
+        aexp, rexp = secs(o.get("expiresAt")), secs(o.get("refreshTokenExpiresAt"))
+        c5, c7 = live(n, now)
+        if not o.get("refreshToken") and not (rexp and rexp <= now):
+            ok = "no (not logged in: tokenbaton login %d)" % n
+        elif usable(o, now):
+            ok = "yes"
+        else:
+            ok = "no (refresh expired: tokenbaton login %d)" % n
+        rows.append(("*" if n == cur else "", str(n), email(n), c5, c7,
+                     rel(aexp, now) if o else "-", rel(rexp, now) if o else "-", ok))
+    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)).rstrip())
+    print("\n* = current account; 5H/7D '*' = sample is from before the window reset (stale)")
+    return 0
+
+
+# --------------------------------------------------------------- keepalive
+
+def claude_bin():
+    """The real claude: $TOKENBATON_CLAUDE, else claude on PATH minus the
+    tokenbaton-exec shim directory (which would pick another account)."""
+    if os.environ.get("TOKENBATON_CLAUDE"):
+        return os.environ["TOKENBATON_CLAUDE"]
+    shim = os.path.join(ACC, "shim")
+    path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                           if os.path.realpath(p) != os.path.realpath(shim))
+    return shutil.which("claude", path=path) or "claude"
+
+
+RECENT = 3600  # a login rewritten within the last hour was just renewed
+
+
+def mtime(n):
+    try:
+        return os.stat(os.path.join(pdir(n), ".credentials.json")).st_mtime
+    except OSError:
+        return 0
+
+
+def lock_age(lock):
+    try:
+        return time.time() - os.stat(lock).st_mtime
+    except OSError:
+        return None
+
+
+def write_oauth(n, o_new_fields):
+    """Atomically rewrite .credentials.json with some claudeAiOauth fields
+    changed, keeping every other key and the 0600 mode."""
+    path = os.path.join(pdir(n), ".credentials.json")
+    with open(path) as f:
+        data = json.load(f)
+    data.setdefault("claudeAiOauth", {}).update(o_new_fields)
+    fd, tmp = tempfile.mkstemp(dir=pdir(n), prefix=".credentials.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def renew(n, reason, forced):
+    """Let claude refresh profile n by itself. Returns (ok, detail)."""
+    d = pdir(n)
+    lock = d + ".lock"
+    age = lock_age(lock)
+    if age is not None:
+        if age < LOCK_STALE:
+            return None, "busy: refresh lock held %ds, left alone" % age
+        try:
+            os.rmdir(lock)
+        except OSError:
+            return None, "busy: stale refresh lock could not be removed"
+    before = read_oauth(n)
+    if forced:
+        # Access token still valid, but the refresh token is running out.
+        # Mark the access token expired so claude's own refresh path runs.
+        write_oauth(n, {"expiresAt": 0})
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=d)
+    env.pop("ANTHROPIC_API_KEY", None)
+    started = time.time()
+    try:
+        subprocess.run([claude_bin(), "auth", "status", "--json"], env=env,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=REFRESH_TIMEOUT, cwd=HOME)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        detail = "claude did not finish (%s)" % type(e).__name__
+    else:
+        detail = None
+    # `claude auth status` can exit without releasing the refresh lock. Its
+    # holder is gone, so once the lock has stopped being touched it is stale.
+    deadline = time.time() + LOCK_SETTLE + 5
+    while time.time() < deadline:
+        age = lock_age(lock)
+        if age is None:
+            break
+        if age >= LOCK_SETTLE and os.stat(lock).st_mtime >= started - 1:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+            break
+        time.sleep(0.5)
+    after = read_oauth(n)
+    now = time.time()
+    aexp = secs(after.get("expiresAt"))
+    if aexp and aexp > now + 60 and after.get("refreshToken"):
+        b = secs(before.get("refreshTokenExpiresAt"))
+        a = secs(after.get("refreshTokenExpiresAt"))
+        slid = "refresh expiry %s -> %s" % (stamp(b), stamp(a)) if a != b else \
+            "refresh expiry unchanged (%s)" % stamp(a)
+        return True, "renewed: access valid until %s, %s" % (stamp(aexp), slid)
+    if forced and after.get("expiresAt") == 0 and \
+            after.get("refreshToken") == before.get("refreshToken"):
+        # Nothing refreshed; put the still-valid access token's expiry back.
+        write_oauth(n, {"expiresAt": before.get("expiresAt")})
+    return False, "FAILED: %s" % (detail or "claude ran but the login was not renewed")
+
+
+def cmd_keepalive(args):
+    if "--install" in args:
+        return install_timer()
+    if "--uninstall" in args:
+        return uninstall_timer()
+    dry = "--dry-run" in args
+    now = time.time()
+    thr = KEEPALIVE_HOURS * 3600
+    print("tokenbaton keepalive %s%s (renew when refresh token expires within %gh)" % (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), " [dry-run]" if dry else "",
+        KEEPALIVE_HOURS))
+    rows, failed = [], False
+    for n in profiles():
+        o = read_oauth(n)
+        aexp, rexp = secs(o.get("expiresAt")), secs(o.get("refreshTokenExpiresAt"))
+        if not o and not os.path.exists(os.path.join(pdir(n), ".claude.json")):
+            continue
+        cols = (n, email(n), rel(aexp, now), rel(rexp, now))
+        if not o.get("refreshToken") and not (rexp and rexp <= now):
+            rows.append(cols + ("not logged in: tokenbaton login %d" % n,))
+            continue
+        if not usable(o, now):
+            rows.append(cols + ("DEAD: refresh token expired, interactive login needed: "
+                                "tokenbaton login %d" % n,))
+            continue
+        access_dead = aexp is None or aexp <= now
+        if access_dead:
+            reason = "access token expired"
+        elif rexp is not None and rexp - now < thr:
+            reason = "refresh token expires %s" % rel(rexp, now)
+        else:
+            rows.append(cols + ("ok, no action",))
+            continue
+        if not access_dead and now - mtime(n) < RECENT:
+            rows.append(cols + ("ok, renewed %s ago by a live session" % rel(mtime(n), now)[:-4],))
+            continue
+        if dry:
+            rows.append(cols + ("would renew (%s)" % reason,))
+            continue
+        ok, detail = renew(n, reason, forced=not access_dead)
+        failed |= ok is False
+        rows.append(cols + ("%s [%s]" % (detail, reason),))
+    for n, em, a, r, act in rows:
+        print("profile %d  %s  access %s  refresh %s  -> %s" % (n, em, a, r, act))
+    return 1 if failed else 0
+
+
+def trim_log():
+    try:
+        if os.path.getsize(LOG) > 1 << 20:
+            keep = open(LOG, "rb").read()[-(256 << 10):]
+            open(LOG, "wb").write(keep)
+    except OSError:
+        pass
+
+
+def systemctl(*a):
+    return subprocess.run([os.environ.get("TOKENBATON_SYSTEMCTL", "systemctl"), "--user", *a],
+                          capture_output=True, text=True)
+
+
+def unit_dir():
+    return os.environ.get("TOKENBATON_UNIT_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
+
+
+def install_timer():
+    os.makedirs(ACC, exist_ok=True)
+    os.makedirs(unit_dir(), exist_ok=True)
+    cb = claude_bin()
+    cb_path = shutil.which(cb) or cb
+    path = os.pathsep.join(dict.fromkeys(
+        [p for p in (os.path.dirname(cb_path), os.path.dirname(os.path.realpath(cb_path)),
+                     os.path.dirname(shutil.which("node") or ""),
+                     *os.environ.get("PATH", "").split(os.pathsep),
+                     "/usr/local/bin", "/usr/bin", "/bin") if p]))
+    service = """[Unit]
+Description=tokenbaton keepalive: renew Claude Code logins before they expire
+
+[Service]
+Type=oneshot
+Environment="PATH=%s"
+Environment="TOKENBATON_HOME=%s"
+Environment="TOKENBATON_PROFILES=%d"
+Environment="TOKENBATON_KEEPALIVE_HOURS=%g"
+ExecStartPre=/bin/sh -c 'mkdir -p "%s"'
+ExecStart=%s keepalive
+StandardOutput=append:%s
+StandardError=append:%s
+""" % (path, ACC, COUNT, KEEPALIVE_HOURS, ACC, SELF, LOG, LOG)
+    timer = """[Unit]
+Description=tokenbaton keepalive every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+    for name, body in ((UNIT + ".service", service), (UNIT + ".timer", timer)):
+        with open(os.path.join(unit_dir(), name), "w") as f:
+            f.write(body)
+    r = systemctl("daemon-reload")
+    e = systemctl("enable", "--now", UNIT + ".timer")
+    if r.returncode or e.returncode:
+        sys.stderr.write("tokenbaton: systemd user timer could not be enabled (%s).\n"
+                         "Use cron instead:\n  0 */6 * * * %s keepalive >> %s 2>&1\n"
+                         % ((r.stderr + e.stderr).strip() or "systemctl failed", SELF, LOG))
+        return 1
+    print("installed %s.timer (every 6h, log: %s)" % (UNIT, LOG))
+    print(systemctl("list-timers", UNIT + ".timer", "--no-pager").stdout.strip())
+    return 0
+
+
+def uninstall_timer():
+    systemctl("disable", "--now", UNIT + ".timer")
+    for name in (".service", ".timer"):
+        try:
+            os.unlink(os.path.join(unit_dir(), UNIT + name))
+        except OSError:
+            pass
+    systemctl("daemon-reload")
+    print("removed %s.timer" % UNIT)
+    return 0
+
+
+# ------------------------------------------------------------------- login
+
+def next_free():
+    n = 1
+    while os.path.exists(os.path.join(pdir(n), ".credentials.json")):
+        n += 1
+    return n
+
+
+def cmd_login(args):
+    if not args or args[0] in ("-h", "--help"):
+        print("usage: tokenbaton login <N> | --new [--email ADDR] [--sso] [--console]")
+        return 2
+    if args[0] == "--new":
+        n = next_free()
+        print("tokenbaton: next free profile is %d (%s)" % (n, pdir(n)))
+        if n > COUNT:
+            print("tokenbaton: set TOKENBATON_PROFILES=%d so it joins the rotation" % n)
+    elif args[0].isdigit() and int(args[0]) >= 1:
+        n = int(args[0])
+    else:
+        print("usage: tokenbaton login <N> | --new", file=sys.stderr)
+        return 2
+    extra = args[1:]
+    before = read_oauth(n)
+    env = dict(os.environ, TOKENBATON_NO_STATE="1")
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    env["PATH"] = os.pathsep.join(
+        p for p in env.get("PATH", "").split(os.pathsep)
+        if os.path.realpath(p) != os.path.realpath(os.path.join(ACC, "shim")))
+    rc = subprocess.call([os.path.join(BIN, "tokenbaton-profile"), str(n), "auth", "login", *extra],
+                         env=env)
+    o = read_oauth(n)
+    if rc != 0 or not o.get("refreshToken"):
+        print("tokenbaton: login for profile %d did not complete (claude exit %d)" % (n, rc),
+              file=sys.stderr)
+        return 1
+    if o == before:
+        print("tokenbaton: warning: profile %d credentials are unchanged" % n, file=sys.stderr)
+    now = time.time()
+    print("tokenbaton: profile %d logged in as %s; access %s, refresh %s" % (
+        n, email(n), rel(secs(o.get("expiresAt")), now), rel(secs(o.get("refreshTokenExpiresAt")), now)))
+    return 0
+
+
+def main(argv):
+    cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ("", [])
+    fn = {"status": cmd_status, "keepalive": cmd_keepalive, "login": cmd_login}.get(cmd)
+    if not fn:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if cmd == "keepalive" and not ({"--dry-run", "--install", "--uninstall"} & set(args)):
+        os.makedirs(ACC, exist_ok=True)
+        trim_log()
+    return fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
