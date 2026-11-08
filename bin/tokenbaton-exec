@@ -21,9 +21,45 @@ for d in "${dirs[@]}"; do
 done
 [[ -n "$real" ]] || { echo "tokenbaton-exec: claude not found on PATH" >&2; exit 127; }
 
-if n="$("$here/tokenbaton" --pick 2>/dev/null)"; then
+pick() { "$here/tokenbaton" --pick 2>/dev/null; }
+
+# Earliest moment an account frees up (epoch s): per account, the latest reset of
+# a window at or above 99% (else its soonest future reset), then the minimum.
+earliest_reset() {
+  local acc="${TOKENBATON_HOME:-$HOME/.tokenbaton}" now best=0 f p5 r5 p7 r7 at block soon
+  now="$(date +%s)"
+  for f in "$acc"/live.*; do
+    read -r p5 r5 p7 r7 at 2>/dev/null < "$f" || continue
+    [[ "$p5$r5$p7$r7" =~ ^[0-9]+$ ]] || continue
+    block=0; soon=0
+    (( p5 >= 99 && r5 > now && r5 > block )) && block=$r5
+    (( p7 >= 99 && r7 > now && r7 > block )) && block=$r7
+    if (( block == 0 )); then
+      (( r5 > now )) && soon=$r5
+      (( r7 > now && (soon == 0 || r7 < soon) )) && soon=$r7
+      block=$soon
+    fi
+    (( block > 0 && (best == 0 || block < best) )) && best=$block
+  done
+  (( best > 0 )) || best=$(( now + 3600 ))
+  echo "$best"
+}
+
+if n="$(pick)"; then
   export CLAUDE_CONFIG_DIR="$HOME/.claude-$n"
+elif n="$(TOKENBATON_SWITCH_AT=99 pick)"; then
+  # Every account is past the configured threshold: cycle to whichever still has
+  # room below 99% instead of stopping (or falling back to a dead default login).
+  echo "tokenbaton-exec: every account is past TOKENBATON_SWITCH_AT=${TOKENBATON_SWITCH_AT:-99}; cycling to account $n" >&2
+  export CLAUDE_CONFIG_DIR="$HOME/.claude-$n"
+elif [[ "${TOKENBATON_FALLBACK_DEFAULT:-}" == 1 ]]; then
+  echo "tokenbaton-exec: no account has room; running on ${CLAUDE_CONFIG_DIR:-the default profile} (TOKENBATON_FALLBACK_DEFAULT=1)" >&2
 else
-  echo "tokenbaton-exec: no account has room; running on ${CLAUDE_CONFIG_DIR:-the default profile}" >&2
+  # All accounts are full. Say so in the shape callers already read as a usage
+  # limit (`... usage limit ... resets <h:mm>am|pm (<tz>)`) so they hold until the
+  # reset instead of treating a default-profile login failure as an auth error.
+  r="$(earliest_reset)"
+  echo "tokenbaton: You've hit your usage limit on every account · resets $(TZ=UTC date -d "@$r" +%-I:%M%P) (UTC)" >&2
+  exit 1
 fi
 exec "$real" "$@"
