@@ -125,14 +125,19 @@ that sat idle after a reset loses that time. `tokenbaton prime` checks every log
 account on the usage endpoint and, for each one whose 5-hour or weekly window isn't
 running, sends one short, ordinary question picked at random (`claude -p` on Haiku,
 no tools, no MCP servers, no saved session; `TOKENBATON_PRIME_PROMPT` sets your own) so the reset clock starts now. Accounts whose windows are already
-running are left alone. An expired access token is renewed first, as in `keepalive`.
+running are left alone.
+
+It doesn't fire right at the reset: the first run that finds a window idle picks a
+random delay (5 to 45 minutes by default, `TOKENBATON_PRIME_DELAY_MIN` / `_MAX`) and
+primes once that has passed, so accounts start at irregular times. The timer itself
+runs every 5 minutes, shifted by up to 2 random minutes each time. An expired access token is renewed first, as in `keepalive`.
 
 ```sh
 tokenbaton prime --dry-run    # report which accounts would be primed
 tokenbaton prime              # prime them now
-tokenbaton prime --install    # systemd user timer, every 15 minutes, log: ~/.tokenbaton/prime.log
+tokenbaton prime --install    # systemd user timer, about every 5 minutes, log: ~/.tokenbaton/prime.log
 tokenbaton prime --uninstall
-# without systemd:  */15 * * * * ~/.local/bin/tokenbaton prime >> ~/.tokenbaton/prime.log 2>&1
+# without systemd:  */5 * * * * ~/.local/bin/tokenbaton prime >> ~/.tokenbaton/prime.log 2>&1
 ```
 
 Each prime costs one very small Haiku request on that account.
@@ -172,6 +177,7 @@ env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
 | `TOKENBATON_HOME` | `~/.tokenbaton` | Where tokenbaton keeps its own small state files. |
 | `TOKENBATON_KEEPALIVE_HOURS` | `72` | `keepalive` warns this many hours before a login ends. |
 | `TOKENBATON_START` | `best` | `last` starts a new window on the last-used account instead of the best one. |
+| `TOKENBATON_PRIME_DELAY_MIN` / `_MAX` | `5` / `45` | `prime` waits a random number of minutes in this range after a window goes idle. |
 | `TOKENBATON_PRIME_MODEL` | `haiku` | Model `prime` sends its message with. |
 
 ## How it works

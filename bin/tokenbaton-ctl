@@ -50,6 +50,10 @@ PRIME_PROMPTS = [
     "Is `chmod 600` right for a file holding credentials? One sentence.",
     "What's the quickest way to see which process is listening on port 8080 on Linux?",
 ]
+# After a window goes idle, wait a random number of minutes in this range
+# before priming it, so accounts don't start exactly at their resets.
+PRIME_DELAY_MIN = float(os.environ.get("TOKENBATON_PRIME_DELAY_MIN") or 5)
+PRIME_DELAY_MAX = float(os.environ.get("TOKENBATON_PRIME_DELAY_MAX") or 45)
 PRIME_TIMEOUT = float(os.environ.get("TOKENBATON_PRIME_TIMEOUT") or 120)
 USAGE_URL = os.environ.get("TOKENBATON_USAGE_URL") or "https://api.anthropic.com/api/oauth/usage"
 
@@ -391,7 +395,7 @@ WantedBy=timers.target
         sys.stderr.write("tokenbaton: systemd user timer could not be enabled (%s).\n"
                          "Use cron instead (%s):\n  %s %s >> %s 2>&1\n"
                          % ((r.stderr + e.stderr).strip() or "systemctl failed", every,
-                            "0 */6 * * *" if cmd == "keepalive" else "*/15 * * * *", SELF + " " + cmd, log))
+                            "0 */6 * * *" if cmd == "keepalive" else "*/5 * * * *", SELF + " " + cmd, log))
         return 1
     print("installed %s.timer (%s, log: %s)" % (unit, every, log))
     print(systemctl("list-timers", unit + ".timer", "--no-pager").stdout.strip())
@@ -477,6 +481,34 @@ def send_prime(n):
     return None
 
 
+def prime_due(n, now, dry):
+    """When profile n's idle window should be primed (epoch s). The first run
+    that sees it idle picks a random delay and saves it in prime.N, so later
+    runs keep the same moment; a dry run only reads it."""
+    path = os.path.join(ACC, "prime.%d" % n)
+    try:
+        return float(open(path).read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    import random
+    lo, hi = sorted((max(PRIME_DELAY_MIN, 0), max(PRIME_DELAY_MAX, 0)))
+    due = now + random.uniform(lo, hi) * 60
+    if not dry:
+        try:
+            with open(path, "w") as f:
+                f.write("%d\n" % due)
+        except OSError:
+            pass
+    return due
+
+
+def prime_clear(n):
+    try:
+        os.unlink(os.path.join(ACC, "prime.%d" % n))
+    except OSError:
+        pass
+
+
 def cmd_prime(args):
     """Start every idle usage window: an account whose 5-hour or weekly window
     isn't running (the endpoint gives it no reset time) gets one tiny message,
@@ -484,7 +516,7 @@ def cmd_prime(args):
     if "--install" in args:
         return install_timer(PRIME_UNIT, "prime", PRIME_LOG,
                              "start idle usage windows so their reset clocks run",
-                             "*:00/15", "every 15 minutes", 60)
+                             "*:00/5", "every 5 minutes", 120)
     if "--uninstall" in args:
         return uninstall_timer(PRIME_UNIT)
     dry = "--dry-run" in args
@@ -519,12 +551,19 @@ def cmd_prime(args):
         idle = [names[k] for k in names if u[k][1] is None]
         if not idle:
             save_live(n, u)
+            prime_clear(n)
             print("%s  %s  -> ok, windows running" % (head, show(u)))
+            continue
+        due = prime_due(n, now, dry)
+        if due > time.time():
+            print("%s  %s  -> %s idle; primes %s" % (head, show(u), "+".join(idle),
+                                                    rel(due, time.time())))
             continue
         if dry:
             print("%s  %s  -> would prime (%s idle)" % (head, show(u), "+".join(idle)))
             continue
         err = send_prime(n)
+        prime_clear(n)
         if err:
             failed = True
             print("%s  %s  -> FAILED to prime: %s" % (head, show(u), err))
