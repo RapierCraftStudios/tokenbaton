@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""tokenbaton account management: keepalive, login, status.
+"""tokenbaton account management: keepalive, prime, login, status.
 
-Reached through `tokenbaton keepalive|login|status`; never prints a token.
+Reached through `tokenbaton keepalive|prime|login|status`; never prints a token.
 
   tokenbaton status
   tokenbaton keepalive [--dry-run] | --install | --uninstall
+  tokenbaton prime [--dry-run] | --install | --uninstall
   tokenbaton login <N> | --new [claude auth login args...]
 """
 import glob
@@ -30,6 +31,11 @@ SELF = os.path.realpath(__file__)
 BIN = os.path.dirname(SELF)
 UNIT = "tokenbaton-keepalive"
 LOG = os.path.join(ACC, "keepalive.log")
+PRIME_UNIT = "tokenbaton-prime"
+PRIME_LOG = os.path.join(ACC, "prime.log")
+PRIME_MODEL = os.environ.get("TOKENBATON_PRIME_MODEL") or "haiku"
+PRIME_TIMEOUT = float(os.environ.get("TOKENBATON_PRIME_TIMEOUT") or 120)
+USAGE_URL = os.environ.get("TOKENBATON_USAGE_URL") or "https://api.anthropic.com/api/oauth/usage"
 
 
 # ---------------------------------------------------------------- profiles
@@ -62,6 +68,32 @@ def email(n):
             return (json.load(f).get("oauthAccount") or {}).get("emailAddress") or "?"
     except (OSError, ValueError):
         return "?"
+
+
+def identity(n):
+    """Who profile n is logged in as: (account, organization), or None. Two
+    profiles with the same identity share one usage pool."""
+    try:
+        with open(os.path.join(pdir(n), ".claude.json")) as f:
+            a = json.load(f).get("oauthAccount") or {}
+    except (OSError, ValueError):
+        return None
+    acct = a.get("accountUuid") or (a.get("emailAddress") or "").lower()
+    return (acct, a.get("organizationUuid") or "") if acct else None
+
+
+def duplicate_of(n, lower_only=False):
+    """The lowest other profile (only lower-numbered ones with lower_only)
+    logged in to the same account as n, or None."""
+    me = identity(n)
+    if not me:
+        return None
+    for m in profiles():
+        if lower_only and m >= n:
+            break
+        if m != n and read_oauth(m).get("refreshToken") and identity(m) == me:
+            return m
+    return None
 
 
 def secs(ms):
@@ -129,7 +161,9 @@ def cmd_status(args):
         if not o.get("refreshToken") and not (rexp and rexp <= now):
             ok = "no (not logged in: tokenbaton login %d)" % n
         elif usable(o, now):
-            ok = "yes"
+            d = duplicate_of(n, lower_only=True)
+            ok = "yes" if d is None else \
+                "no (DUPLICATE of %d, same account: tokenbaton login %d with another)" % (d, n)
         else:
             ok = "no (refresh expired: tokenbaton login %d)" % n
         rows.append(("*" if n == cur else "", str(n), email(n), c5, c7,
@@ -294,11 +328,11 @@ def cmd_keepalive(args):
     return 1 if failed else 0
 
 
-def trim_log():
+def trim_log(log=LOG):
     try:
-        if os.path.getsize(LOG) > 1 << 20:
-            keep = open(LOG, "rb").read()[-(256 << 10):]
-            open(LOG, "wb").write(keep)
+        if os.path.getsize(log) > 1 << 20:
+            keep = open(log, "rb").read()[-(256 << 10):]
+            open(log, "wb").write(keep)
     except OSError:
         pass
 
@@ -313,7 +347,8 @@ def unit_dir():
         os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
 
 
-def install_timer():
+def install_timer(unit=UNIT, cmd="keepalive", log=LOG, desc="renew Claude Code logins before they expire",
+                  calendar="*-*-* 00/6:00:00", every="every 6 hours", jitter=300):
     os.makedirs(ACC, exist_ok=True)
     os.makedirs(unit_dir(), exist_ok=True)
     cb = claude_bin()
@@ -324,7 +359,7 @@ def install_timer():
                      *os.environ.get("PATH", "").split(os.pathsep),
                      "/usr/local/bin", "/usr/bin", "/bin") if p]))
     service = """[Unit]
-Description=tokenbaton keepalive: renew Claude Code logins before they expire
+Description=tokenbaton %s: %s
 
 [Service]
 Type=oneshot
@@ -333,46 +368,180 @@ Environment="TOKENBATON_HOME=%s"
 Environment="TOKENBATON_PROFILES=%d"
 Environment="TOKENBATON_KEEPALIVE_HOURS=%g"
 ExecStartPre=/bin/sh -c 'mkdir -p "%s"'
-ExecStart=%s keepalive
+ExecStart=%s %s
 StandardOutput=append:%s
 StandardError=append:%s
-""" % (path, ACC, COUNT, KEEPALIVE_HOURS, ACC, SELF, LOG, LOG)
+""" % (cmd, desc, path, ACC, COUNT, KEEPALIVE_HOURS, ACC, SELF, cmd, log, log)
+    if PRIME_MODEL != "haiku":
+        service = service.replace("[Service]\n", '[Service]\nEnvironment="TOKENBATON_PRIME_MODEL=%s"\n' % PRIME_MODEL)
     timer = """[Unit]
-Description=tokenbaton keepalive every 6 hours
+Description=tokenbaton %s %s
 
 [Timer]
-OnCalendar=*-*-* 00/6:00:00
-RandomizedDelaySec=300
+OnCalendar=%s
+RandomizedDelaySec=%d
 Persistent=true
 
 [Install]
 WantedBy=timers.target
-"""
-    for name, body in ((UNIT + ".service", service), (UNIT + ".timer", timer)):
+""" % (cmd, every, calendar, jitter)
+    for name, body in ((unit + ".service", service), (unit + ".timer", timer)):
         with open(os.path.join(unit_dir(), name), "w") as f:
             f.write(body)
     r = systemctl("daemon-reload")
-    e = systemctl("enable", "--now", UNIT + ".timer")
+    e = systemctl("enable", "--now", unit + ".timer")
     if r.returncode or e.returncode:
         sys.stderr.write("tokenbaton: systemd user timer could not be enabled (%s).\n"
-                         "Use cron instead:\n  0 */6 * * * %s keepalive >> %s 2>&1\n"
-                         % ((r.stderr + e.stderr).strip() or "systemctl failed", SELF, LOG))
+                         "Use cron instead (%s):\n  %s %s >> %s 2>&1\n"
+                         % ((r.stderr + e.stderr).strip() or "systemctl failed", every,
+                            "0 */6 * * *" if cmd == "keepalive" else "*/15 * * * *", SELF + " " + cmd, log))
         return 1
-    print("installed %s.timer (every 6h, log: %s)" % (UNIT, LOG))
-    print(systemctl("list-timers", UNIT + ".timer", "--no-pager").stdout.strip())
+    print("installed %s.timer (%s, log: %s)" % (unit, every, log))
+    print(systemctl("list-timers", unit + ".timer", "--no-pager").stdout.strip())
     return 0
 
 
-def uninstall_timer():
-    systemctl("disable", "--now", UNIT + ".timer")
+def uninstall_timer(unit=UNIT):
+    systemctl("disable", "--now", unit + ".timer")
     for name in (".service", ".timer"):
         try:
-            os.unlink(os.path.join(unit_dir(), UNIT + name))
+            os.unlink(os.path.join(unit_dir(), unit + name))
         except OSError:
             pass
     systemctl("daemon-reload")
-    print("removed %s.timer" % UNIT)
+    print("removed %s.timer" % unit)
     return 0
+
+
+# ------------------------------------------------------------------- prime
+
+def iso_epoch(v):
+    """'2026-11-17T08:00:00.014+00:00' -> epoch seconds, None if absent."""
+    if not v:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(re.sub(r"\.\d+", "", v).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def fetch_usage(n):
+    """The usage endpoint's five_hour/seven_day for profile n, or (None, why)."""
+    import urllib.request
+    import urllib.error
+    tok = read_oauth(n).get("accessToken")
+    if not tok:
+        return None, "no access token"
+    req = urllib.request.Request(USAGE_URL.replace("{n}", str(n)), headers={
+        "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"})
+    try:
+        d = json.load(urllib.request.urlopen(req, timeout=15))
+    except urllib.error.HTTPError as e:
+        return None, "usage endpoint HTTP %d" % e.code
+    except (OSError, ValueError) as e:
+        return None, "usage endpoint unreachable (%s)" % type(e).__name__
+    out = {}
+    for k in ("five_hour", "seven_day"):
+        w = d.get(k) or {}
+        out[k] = (round(w.get("utilization") or 0), iso_epoch(w.get("resets_at")))
+    return out, None
+
+
+def save_live(n, u):
+    """Record the endpoint's figures where status and the switcher read them."""
+    (p5, r5), (p7, r7) = u["five_hour"], u["seven_day"]
+    path = os.path.join(ACC, "live.%d" % n)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as f:
+            f.write("%d %d %d %d %d\n" % (p5, r5 or 0, p7, r7 or 0, time.time()))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def send_prime(n):
+    """One tiny headless message on profile n: no tools, no MCP, no saved session."""
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=pdir(n), TOKENBATON_NO_STATE="1")
+    env.pop("ANTHROPIC_API_KEY", None)
+    try:
+        r = subprocess.run([claude_bin(), "-p", "Reply with just: ok", "--model", PRIME_MODEL,
+                            "--tools", "", "--strict-mcp-config", "--no-session-persistence"],
+                           env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=PRIME_TIMEOUT, cwd=tempfile.gettempdir())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "claude did not finish (%s)" % type(e).__name__
+    if r.returncode:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        return "claude exited %d%s" % (r.returncode, (": " + msg[-1][:120]) if msg else "")
+    return None
+
+
+def cmd_prime(args):
+    """Start every idle usage window: an account whose 5-hour or weekly window
+    isn't running (the endpoint gives it no reset time) gets one tiny message,
+    so its clock starts now instead of whenever it is next used."""
+    if "--install" in args:
+        return install_timer(PRIME_UNIT, "prime", PRIME_LOG,
+                             "start idle usage windows so their reset clocks run",
+                             "*:00/15", "every 15 minutes", 60)
+    if "--uninstall" in args:
+        return uninstall_timer(PRIME_UNIT)
+    dry = "--dry-run" in args
+    now = time.time()
+    print("tokenbaton prime %s%s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                                     " [dry-run]" if dry else ""))
+    failed = False
+    names = {"five_hour": "5h", "seven_day": "7d"}
+
+    def show(u):
+        return "  ".join("%s %d%% %s" % (names[k], u[k][0], rel(u[k][1], time.time()) if u[k][1]
+                                         else "idle") for k in names)
+    for n in profiles():
+        o = read_oauth(n)
+        if not o:
+            continue
+        head = "profile %d  %s" % (n, email(n))
+        if not usable(o, now):
+            print("%s  -> skipped: not logged in (tokenbaton login %d)" % (head, n))
+            continue
+        aexp = secs(o.get("expiresAt"))
+        if (aexp is None or aexp <= now + 60) and not dry:
+            ok, detail = renew(n, "access token expired", forced=False)
+            if not ok:
+                failed |= ok is False
+                print("%s  -> skipped: %s" % (head, detail))
+                continue
+        u, why = fetch_usage(n)
+        if u is None:
+            print("%s  -> skipped: %s" % (head, why))
+            continue
+        idle = [names[k] for k in names if u[k][1] is None]
+        if not idle:
+            save_live(n, u)
+            print("%s  %s  -> ok, windows running" % (head, show(u)))
+            continue
+        if dry:
+            print("%s  %s  -> would prime (%s idle)" % (head, show(u), "+".join(idle)))
+            continue
+        err = send_prime(n)
+        if err:
+            failed = True
+            print("%s  %s  -> FAILED to prime: %s" % (head, show(u), err))
+            continue
+        after = None
+        for _ in range(3):
+            time.sleep(5)
+            after, _why = fetch_usage(n)
+            if after and all(after[k][1] for k in names):
+                break
+        if after:
+            save_live(n, after)
+            print("%s  -> primed (%s idle); now %s" % (head, "+".join(idle), show(after)))
+        else:
+            print("%s  -> primed (%s idle); new reset times not read yet" % (head, "+".join(idle)))
+    return 1 if failed else 0
 
 
 # ------------------------------------------------------------------- login
@@ -382,6 +551,30 @@ def next_free():
     while os.path.exists(os.path.join(pdir(n), ".credentials.json")):
         n += 1
     return n
+
+
+def restore_login(n, saved):
+    """Put profile n's login files back to the bytes saved before a login
+    (removing a login file that didn't exist before), keeping 0600."""
+    for name, data in saved.items():
+        path = os.path.join(pdir(n), name)
+        if data is None:
+            if name == ".credentials.json":
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            continue
+        real = os.path.realpath(path)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, real)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
 
 def cmd_login(args):
@@ -400,6 +593,13 @@ def cmd_login(args):
         return 2
     extra = args[1:]
     before = read_oauth(n)
+    saved = {}
+    for name in (".credentials.json", ".claude.json"):
+        try:
+            with open(os.path.join(pdir(n), name), "rb") as f:
+                saved[name] = f.read()
+        except OSError:
+            saved[name] = None
     env = dict(os.environ, TOKENBATON_NO_STATE="1")
     env.pop("CLAUDE_CONFIG_DIR", None)
     env["PATH"] = os.pathsep.join(
@@ -412,6 +612,15 @@ def cmd_login(args):
         print("tokenbaton: login for profile %d did not complete (claude exit %d)" % (n, rc),
               file=sys.stderr)
         return 1
+    dup = duplicate_of(n)
+    if dup is not None:
+        who = email(n)
+        restore_login(n, saved)
+        print("tokenbaton: rejected: %s is already logged in on profile %d; each profile must be "
+              "a different account (they would share one usage pool). Profile %d was %s." % (
+                  who, dup, n, "put back as it was" if saved[".credentials.json"] else "left logged out"),
+              file=sys.stderr)
+        return 1
     if o == before:
         print("tokenbaton: warning: profile %d credentials are unchanged" % n, file=sys.stderr)
     now = time.time()
@@ -422,13 +631,14 @@ def cmd_login(args):
 
 def main(argv):
     cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ("", [])
-    fn = {"status": cmd_status, "keepalive": cmd_keepalive, "login": cmd_login}.get(cmd)
+    fn = {"status": cmd_status, "keepalive": cmd_keepalive, "prime": cmd_prime,
+          "login": cmd_login}.get(cmd)
     if not fn:
         print(__doc__, file=sys.stderr)
         return 2
-    if cmd == "keepalive" and not ({"--dry-run", "--install", "--uninstall"} & set(args)):
+    if cmd in ("keepalive", "prime") and not ({"--dry-run", "--install", "--uninstall"} & set(args)):
         os.makedirs(ACC, exist_ok=True)
-        trim_log()
+        trim_log(LOG if cmd == "keepalive" else PRIME_LOG)
     return fn(args)
 
 
