@@ -51,6 +51,12 @@ Your conversations, settings, memory, `CLAUDE.md`, commands, agents, skills, plu
 and prompt history stay in `~/.claude` and are symlinked into every profile, so they
 are shared by all of them. Only the login differs between accounts.
 
+The live-session registry (`sessions/`, where Claude Code lists running sessions so
+they can find and message each other) is shared the same way, so sessions on
+different accounts see and talk to each other. A profile that still has its own
+`sessions/` folder has its records moved into `~/.claude/sessions` the next time any
+profile is launched.
+
 ## Use
 
 ```sh

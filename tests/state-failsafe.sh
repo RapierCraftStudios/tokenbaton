@@ -33,9 +33,13 @@ if [[ "$n" == 1 ]]; then
   ls "$acc" > "$TB_TEST/after-hooks"
   [[ -n "${TB_READONLY:-}" ]] && chmod a-w "$acc"
 fi
-dir="$HOME/.claude-$n"; mkdir -p "$dir/sessions"
+dir="$HOME/.claude-$n"; reg="$dir/sessions"
+# TB_SHARED: records go to the shared registry, as with real tokenbaton-profile;
+# the account is then known only from the process's CLAUDE_CONFIG_DIR.
+[[ -n "${TB_SHARED:-}" ]] && { reg="$HOME/.claude/sessions"; export CLAUDE_CONFIG_DIR="$dir"; }
+mkdir -p "$reg"
 printf '{"sessionId":"%s","startedAt":%s,"status":"%s"}' \
-  "$sid" "$(( $(date +%s) * 1000 ))" "${TB_STATUS:-idle}" > "$dir/sessions/$$.json"
+  "$sid" "$(( $(date +%s) * 1000 ))" "${TB_STATUS:-idle}" > "$reg/$$.json"
 [[ "$n" == 1 ]] && exec sleep 60
 exit 0
 SH
@@ -110,6 +114,14 @@ setup; TB_SWEEP=1 run claude-go
 check "another window's start-up sweep keeps a live claude-go window's state" \
   "grep -q '^go\.[0-9]*\.profile\$' '$T/after-hooks'"
 check "  ...and that window still switches" switched
+teardown
+
+setup; TB_SHARED=1 run tokenbaton
+check "shared session registry: account read from the process, still switches" switched
+teardown
+
+setup; TB_SHARED=1 TB_RM=profile run tokenbaton
+check "shared registry with the profile file gone: still switches" switched
 teardown
 
 setup; touch "$T/acc/go.999999999.profile" "$T/acc/go.999999999.auto"; run tokenbaton
