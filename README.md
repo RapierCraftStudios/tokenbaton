@@ -86,47 +86,45 @@ tokenbaton keepalive    # renew logins that are about to expire
 ```
 
 `status` never prints tokens. A `*` after a usage figure means the sample is from
-before that window reset (so the real figure is now 0). `usable` is `no` when the
-refresh token has expired; only an interactive `tokenbaton login N` fixes that.
+before that window reset (so the real figure is now 0). `LOGIN ENDS` is when the
+login runs out; `usable` is `no` once it has, and only an interactive
+`tokenbaton login N` fixes that.
 
-**Why logins die.** Claude Code's refresh token expires about a day after it was last
-used (the access token, about 8 hours). An account nothing runs on for a day drops out
-of the rotation until someone logs in again. `tokenbaton keepalive` prevents that: for
-every profile whose refresh token expires within `TOKENBATON_KEEPALIVE_HOURS` (default
-48) or whose access token has expired, it has Claude Code itself renew the login, so the
-refresh token's lifetime moves forward. It reports email, access expiry, refresh expiry
-and the action per profile; `--dry-run` only reports.
+**Why logins die.** A Claude Code login lasts a fixed time from sign-in (about 30
+days). Refreshing it doesn't extend that: on every refresh Claude Code keeps the
+earlier of the old and new end dates, and once that date passes it treats the account
+as logged out. Only an interactive `tokenbaton login N` starts a new login. The access
+token (about 8 hours) is renewed along the way.
+
+`tokenbaton keepalive` keeps every account ready and tells you in time:
+
+- An expired access token is renewed, so the account is ready the moment a window
+  switches to it. It runs the real `claude auth status` with `CLAUDE_CONFIG_DIR` set to
+  the profile; that makes no model call and refreshes through Claude Code's own code
+  path and file format. tokenbaton never calls the OAuth endpoint and never prints a token.
+- A login that ends within `TOKENBATON_KEEPALIVE_HOURS` (default 72) is reported as
+  `LOGIN ENDS in …` with the `tokenbaton login N` command, and a desktop notification
+  (`notify-send`, or `osascript` on macOS) names it. A login that already ended is
+  reported as `DEAD` the same way.
+- Claude Code's refresh lock (`~/.claude-N.lock`) is respected: a lock touched in the
+  last minute means someone is refreshing and the profile is skipped. Because `claude
+  auth status` can exit without releasing that lock, tokenbaton removes it afterwards
+  once it has stopped being touched.
 
 ```sh
+tokenbaton keepalive --dry-run     # report only
 tokenbaton keepalive --install     # systemd user timer, every 6 hours, log: ~/.tokenbaton/keepalive.log
 tokenbaton keepalive --uninstall
 # without systemd:  0 */6 * * * ~/.local/bin/tokenbaton keepalive >> ~/.tokenbaton/keepalive.log 2>&1
 ```
-
-How a renewal is done, and why it is safe:
-
-- It runs the real `claude auth status` with `CLAUDE_CONFIG_DIR` set to the profile.
-  That command makes no model call (no quota); when the access token is expired it
-  refreshes the login through Claude Code's own code path and file format. tokenbaton
-  never calls the OAuth endpoint and never reads a token into its output.
-- If the access token is still valid but the refresh token is running out, the access
-  token's `expiresAt` is set to 0 first (atomic write, other keys and the 0600 mode
-  kept) so that refresh path runs. If nothing was renewed, the original value is put back.
-- Claude Code's refresh lock (`~/.claude-N.lock`) is respected: a lock touched in the
-  last minute means someone is refreshing and the profile is skipped. Because `claude
-  auth status` can exit without releasing that lock, tokenbaton removes it afterwards
-  once it has stopped being touched; no other process is refreshing at that point.
-- A login another session rewrote in the last hour was just renewed and is left alone.
-- A profile whose refresh token has already expired is reported as `DEAD` with the
-  `tokenbaton login N` command; it cannot be revived without logging in.
 
 ## Start idle usage clocks
 
 A usage window only starts counting down when the account is next used, so an account
 that sat idle after a reset loses that time. `tokenbaton prime` checks every logged-in
 account on the usage endpoint and, for each one whose 5-hour or weekly window isn't
-running, sends one tiny message (`claude -p` on Haiku, no tools, no MCP servers, no
-saved session) so the reset clock starts now. Accounts whose windows are already
+running, sends one short, ordinary question picked at random (`claude -p` on Haiku,
+no tools, no MCP servers, no saved session; `TOKENBATON_PRIME_PROMPT` sets your own) so the reset clock starts now. Accounts whose windows are already
 running are left alone. An expired access token is renewed first, as in `keepalive`.
 
 ```sh
@@ -172,7 +170,7 @@ env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
 | `TOKENBATON_SWITCH_AT` | `99` | Usage percent that triggers a switch. `0` turns auto-switch off. |
 | `TOKENBATON_PROFILES` | `5` | Number of account profiles (`~/.claude-1` … `~/.claude-N`). |
 | `TOKENBATON_HOME` | `~/.tokenbaton` | Where tokenbaton keeps its own small state files. |
-| `TOKENBATON_KEEPALIVE_HOURS` | `48` | `keepalive` renews a login whose refresh token expires within this many hours. |
+| `TOKENBATON_KEEPALIVE_HOURS` | `72` | `keepalive` warns this many hours before a login ends. |
 | `TOKENBATON_START` | `best` | `last` starts a new window on the last-used account instead of the best one. |
 | `TOKENBATON_PRIME_MODEL` | `haiku` | Model `prime` sends its message with. |
 

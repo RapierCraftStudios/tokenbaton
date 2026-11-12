@@ -21,7 +21,10 @@ import time
 HOME = os.path.expanduser("~")
 ACC = os.environ.get("TOKENBATON_HOME") or os.path.join(HOME, ".tokenbaton")
 COUNT = int(os.environ.get("TOKENBATON_PROFILES") or 5)
-KEEPALIVE_HOURS = float(os.environ.get("TOKENBATON_KEEPALIVE_HOURS") or 48)
+# A login lasts a fixed time from sign-in (Claude Code stores the earlier of the
+# old and new refresh expiry on every refresh, so no refresh can extend it).
+# keepalive warns this many hours before a login runs out.
+KEEPALIVE_HOURS = float(os.environ.get("TOKENBATON_KEEPALIVE_HOURS") or 72)
 # proper-lockfile (what Claude Code uses) treats a lock whose mtime hasn't been
 # touched for ~10s as stale; a live holder keeps touching it.
 LOCK_SETTLE = float(os.environ.get("TOKENBATON_LOCK_SETTLE") or 15)
@@ -34,6 +37,19 @@ LOG = os.path.join(ACC, "keepalive.log")
 PRIME_UNIT = "tokenbaton-prime"
 PRIME_LOG = os.path.join(ACC, "prime.log")
 PRIME_MODEL = os.environ.get("TOKENBATON_PRIME_MODEL") or "haiku"
+# Short, ordinary questions; one is picked at random each time.
+PRIME_PROMPTS = [
+    "What's a good one-line description for a git commit that fixes a typo in a README?",
+    "Quick one: is it 'log in' or 'login' when it's used as a verb?",
+    "What's the difference between `git fetch` and `git pull`, in one sentence?",
+    "In one sentence, when would you use a set instead of a list in Python?",
+    "What does `set -euo pipefail` do in a bash script? Keep it short.",
+    "What would you call a function that checks whether a file is older than a day?",
+    "In one line: what's the difference between `==` and `is` in Python?",
+    "What's a sensible default timeout for an HTTP health check? Short answer is fine.",
+    "Is `chmod 600` right for a file holding credentials? One sentence.",
+    "What's the quickest way to see which process is listening on port 8080 on Linux?",
+]
 PRIME_TIMEOUT = float(os.environ.get("TOKENBATON_PRIME_TIMEOUT") or 120)
 USAGE_URL = os.environ.get("TOKENBATON_USAGE_URL") or "https://api.anthropic.com/api/oauth/usage"
 
@@ -151,7 +167,7 @@ def live(n, now):
 def cmd_status(args):
     now = time.time()
     cur = current()
-    rows = [("", "N", "EMAIL", "5H", "7D", "ACCESS", "REFRESH", "USABLE")]
+    rows = [("", "N", "EMAIL", "5H", "7D", "ACCESS", "LOGIN ENDS", "USABLE")]
     for n in profiles():
         o = read_oauth(n)
         if not o and not os.path.isdir(pdir(n)):
@@ -188,16 +204,6 @@ def claude_bin():
     return shutil.which("claude", path=path) or "claude"
 
 
-RECENT = 3600  # a login rewritten within the last hour was just renewed
-
-
-def mtime(n):
-    try:
-        return os.stat(os.path.join(pdir(n), ".credentials.json")).st_mtime
-    except OSError:
-        return 0
-
-
 def lock_age(lock):
     try:
         return time.time() - os.stat(lock).st_mtime
@@ -205,25 +211,7 @@ def lock_age(lock):
         return None
 
 
-def write_oauth(n, o_new_fields):
-    """Atomically rewrite .credentials.json with some claudeAiOauth fields
-    changed, keeping every other key and the 0600 mode."""
-    path = os.path.join(pdir(n), ".credentials.json")
-    with open(path) as f:
-        data = json.load(f)
-    data.setdefault("claudeAiOauth", {}).update(o_new_fields)
-    fd, tmp = tempfile.mkstemp(dir=pdir(n), prefix=".credentials.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, separators=(",", ":"))
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-
-
-def renew(n, reason, forced):
+def renew(n, reason):
     """Let claude refresh profile n by itself. Returns (ok, detail)."""
     d = pdir(n)
     lock = d + ".lock"
@@ -236,10 +224,6 @@ def renew(n, reason, forced):
         except OSError:
             return None, "busy: stale refresh lock could not be removed"
     before = read_oauth(n)
-    if forced:
-        # Access token still valid, but the refresh token is running out.
-        # Mark the access token expired so claude's own refresh path runs.
-        write_oauth(n, {"expiresAt": 0})
     env = dict(os.environ, CLAUDE_CONFIG_DIR=d)
     env.pop("ANTHROPIC_API_KEY", None)
     started = time.time()
@@ -274,10 +258,6 @@ def renew(n, reason, forced):
         slid = "refresh expiry %s -> %s" % (stamp(b), stamp(a)) if a != b else \
             "refresh expiry unchanged (%s)" % stamp(a)
         return True, "renewed: access valid until %s, %s" % (stamp(aexp), slid)
-    if forced and after.get("expiresAt") == 0 and \
-            after.get("refreshToken") == before.get("refreshToken"):
-        # Nothing refreshed; put the still-valid access token's expiry back.
-        write_oauth(n, {"expiresAt": before.get("expiresAt")})
     return False, "FAILED: %s" % (detail or "claude ran but the login was not renewed")
 
 
@@ -289,10 +269,10 @@ def cmd_keepalive(args):
     dry = "--dry-run" in args
     now = time.time()
     thr = KEEPALIVE_HOURS * 3600
-    print("tokenbaton keepalive %s%s (renew when refresh token expires within %gh)" % (
+    print("tokenbaton keepalive %s%s (renew expired access tokens; warn %gh before a login ends)" % (
         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), " [dry-run]" if dry else "",
         KEEPALIVE_HOURS))
-    rows, failed = [], False
+    rows, failed, warn = [], False, []
     for n in profiles():
         o = read_oauth(n)
         aexp, rexp = secs(o.get("expiresAt")), secs(o.get("refreshTokenExpiresAt"))
@@ -303,29 +283,46 @@ def cmd_keepalive(args):
             rows.append(cols + ("not logged in: tokenbaton login %d" % n,))
             continue
         if not usable(o, now):
-            rows.append(cols + ("DEAD: refresh token expired, interactive login needed: "
+            warn.append("profile %d (%s) is logged out: tokenbaton login %d" % (n, email(n), n))
+            rows.append(cols + ("DEAD: login ended, interactive login needed: "
                                 "tokenbaton login %d" % n,))
             continue
-        access_dead = aexp is None or aexp <= now
-        if access_dead:
-            reason = "access token expired"
-        elif rexp is not None and rexp - now < thr:
-            reason = "refresh token expires %s" % rel(rexp, now)
-        else:
-            rows.append(cols + ("ok, no action",))
-            continue
-        if not access_dead and now - mtime(n) < RECENT:
-            rows.append(cols + ("ok, renewed %s ago by a live session" % rel(mtime(n), now)[:-4],))
+        ending = ""
+        if rexp is not None and rexp - now < thr:
+            warn.append("profile %d (%s) login ends %s: tokenbaton login %d" % (
+                n, email(n), rel(rexp, now), n))
+            ending = "; LOGIN ENDS %s, a refresh can't extend it: tokenbaton login %d" % (
+                rel(rexp, now), n)
+        if aexp is not None and aexp > now:
+            rows.append(cols + ("ok, no action" + ending,))
             continue
         if dry:
-            rows.append(cols + ("would renew (%s)" % reason,))
+            rows.append(cols + ("would renew (access token expired)" + ending,))
             continue
-        ok, detail = renew(n, reason, forced=not access_dead)
+        ok, detail = renew(n, "access token expired")
         failed |= ok is False
-        rows.append(cols + ("%s [%s]" % (detail, reason),))
+        rows.append(cols + ("%s [access token expired]%s" % (detail, ending),))
     for n, em, a, r, act in rows:
-        print("profile %d  %s  access %s  refresh %s  -> %s" % (n, em, a, r, act))
+        print("profile %d  %s  access %s  login ends %s  -> %s" % (n, em, a, r, act))
+    if warn and not dry:
+        notify("tokenbaton: log in again soon", "\n".join(warn))
     return 1 if failed else 0
+
+
+def notify(title, body):
+    """Desktop notification, where one can be shown; the log has it either way."""
+    tool = shutil.which("notify-send") or shutil.which("osascript")
+    if not tool or os.environ.get("TOKENBATON_NO_NOTIFY"):
+        return
+    try:
+        if tool.endswith("osascript"):
+            subprocess.run([tool, "-e", "display notification %s with title %s" % (
+                json.dumps(body), json.dumps(title))], timeout=10, capture_output=True)
+        else:
+            subprocess.run([tool, "-u", "critical", "-a", "tokenbaton", title, body],
+                           timeout=10, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def trim_log(log=LOG):
@@ -462,11 +459,13 @@ def save_live(n, u):
 
 
 def send_prime(n):
-    """One tiny headless message on profile n: no tools, no MCP, no saved session."""
+    """One short, ordinary question on profile n: no tools, no MCP, no saved session."""
+    import random
+    prompt = os.environ.get("TOKENBATON_PRIME_PROMPT") or random.choice(PRIME_PROMPTS)
     env = dict(os.environ, CLAUDE_CONFIG_DIR=pdir(n), TOKENBATON_NO_STATE="1")
     env.pop("ANTHROPIC_API_KEY", None)
     try:
-        r = subprocess.run([claude_bin(), "-p", "Reply with just: ok", "--model", PRIME_MODEL,
+        r = subprocess.run([claude_bin(), "-p", prompt, "--model", PRIME_MODEL,
                             "--tools", "", "--strict-mcp-config", "--no-session-persistence"],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                            timeout=PRIME_TIMEOUT, cwd=tempfile.gettempdir())
@@ -508,7 +507,7 @@ def cmd_prime(args):
             continue
         aexp = secs(o.get("expiresAt"))
         if (aexp is None or aexp <= now + 60) and not dry:
-            ok, detail = renew(n, "access token expired", forced=False)
+            ok, detail = renew(n, "access token expired")
             if not ok:
                 failed |= ok is False
                 print("%s  -> skipped: %s" % (head, detail))

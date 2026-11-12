@@ -36,6 +36,7 @@ elif [[ "$1 $2" == "auth login" ]]; then
   echo "{\"oauthAccount\":{\"emailAddress\":\"${STUB_LOGIN_EMAIL:-new@example.com}\",\"accountUuid\":\"${STUB_LOGIN_UUID:-u-new}\",\"organizationUuid\":\"org\"}}" > "$d/.claude.json"
 fi
 SH
+  printf '#!/bin/sh\nshift 4; printf "%%s\\n" "$@" >> "%s/notify.calls"\n' "$T" > "$T/bin/notify-send"
   chmod +x "$T/bin/"*
   export PATH="$T/bin:$PATH" HOME="$T/home" TOKENBATON_HOME="$T/acc" TOKENBATON_CLAUDE="$T/bin/claude" TB_TEST="$T" \
          TOKENBATON_LOCK_SETTLE=1 TOKENBATON_LOCK_STALE=60 TOKENBATON_PROFILES=3
@@ -72,43 +73,44 @@ ok "status prints no secrets" "! grep -q SECRET <<<\"\$OUT\""
 teardown
 
 # --- keepalive
-setup; profile 1 7200 90000 a@x.io; profile 2 -100 90000 b@x.io; profile 3 7200 400000 c@x.io
+# 1: access valid, login ends in 25h (inside the 72h warning window)
+# 2: access expired, login fine     3: healthy
+setup; profile 1 7200 90000 a@x.io; profile 2 -100 400000 b@x.io; profile 3 7200 400000 c@x.io
 tb keepalive --dry-run
-ok "dry-run: no claude calls" "[[ \$(calls) == 0 ]]"
-ok "dry-run: near-expiry refresh and expired access would renew; healthy left" \
-   "[[ \$(grep -c 'would renew' <<<\"\$OUT\") == 2 ]] && grep -E 'profile 3' <<<\"\$OUT\" | grep -q 'ok, no action'"
+ok "dry-run: no claude calls, no notification" "[[ \$(calls) == 0 ]] && [[ ! -e '$T/notify.calls' ]]"
+ok "dry-run: only the expired access token would renew" \
+   "[[ \$(grep -c 'would renew' <<<\"\$OUT\") == 1 ]] && grep 'profile 2' <<<\"\$OUT\" | grep -q 'would renew'"
 ok "dry-run reports no secrets" "! grep -q SECRET <<<\"\$OUT\""
 teardown
 
-setup; profile 1 7200 90000 a@x.io; profile 2 -100 90000 b@x.io; profile 3 7200 400000 c@x.io
+setup; profile 1 7200 90000 a@x.io; profile 2 -100 400000 b@x.io; profile 3 7200 400000 c@x.io
 tb keepalive
 ok "keepalive exits 0" "[[ \$RC == 0 ]]"
-ok "keepalive ran claude for profiles 1 and 2 only, with their config dirs" \
-   "[[ \$(calls) == 2 ]] && grep -q \"^\$HOME/.claude-1 \" '$T/claude.calls' && grep -q \"^\$HOME/.claude-2 \" '$T/claude.calls' && ! grep -q claude-3 '$T/claude.calls'"
+ok "claude runs only for the expired access token" \
+   "[[ \$(calls) == 1 ]] && grep -q \"^\$HOME/.claude-2 \" '$T/claude.calls'"
 ok "expired access token renewed by claude" "grep -q NEWA '$HOME/.claude-2/.credentials.json'"
-ok "forced refresh when only refresh token is near expiry" "grep -q NEWA '$HOME/.claude-1/.credentials.json'"
+ok "a login near its end is not force-refreshed (a refresh can't extend it)" \
+   "grep -q SECRET-A1 '$HOME/.claude-1/.credentials.json'"
+ok "a login near its end is reported with the login command" \
+   "grep 'profile 1' <<<\"\$OUT\" | grep -q 'LOGIN ENDS in 1d0h.*tokenbaton login 1'"
+ok "and a desktop notification names it" "grep -q 'profile 1 (a@x.io) login ends' '$T/notify.calls' && ! grep -q 'profile 3' '$T/notify.calls'"
 ok "other credential keys preserved, mode 0600" \
-   "grep -q mcpOAuth '$HOME/.claude-1/.credentials.json' && [[ \$(stat -c %a '$HOME/.claude-1/.credentials.json') == 600 ]]"
+   "grep -q mcpOAuth '$HOME/.claude-2/.credentials.json' && [[ \$(stat -c %a '$HOME/.claude-2/.credentials.json') == 600 ]]"
 ok "healthy profile untouched" "grep -q SECRET-A3 '$HOME/.claude-3/.credentials.json'"
-ok "report says renewed, no secrets" "[[ \$(grep -c 'renewed' <<<\"\$OUT\") == 2 ]] && ! grep -qE 'SECRET|NEW[AR]' <<<\"\$OUT\""
+ok "report says renewed, no secrets" "[[ \$(grep -c 'renewed' <<<\"\$OUT\") == 1 ]] && ! grep -qE 'SECRET|NEW[AR]' <<<\"\$OUT\""
 teardown
 
-# claude fails to refresh: original access expiry restored (not left zeroed), exit 1
-setup; profile 1 7200 90000 a@x.io; orig="$(cat "$HOME/.claude-1/.credentials.json")"
+# claude fails to refresh: reported, exit 1, credentials untouched
+setup; profile 1 -100 400000 a@x.io; orig="$(cat "$HOME/.claude-1/.credentials.json")"
 STUB_FAIL=1 tb keepalive
 ok "failed renewal reported, exit 1" "[[ \$RC == 1 ]] && grep -q FAILED <<<\"\$OUT\""
 ok "failed renewal leaves credentials as they were" "[[ \"\$(cat '$HOME/.claude-1/.credentials.json')\" == '$orig' ]]"
 teardown
 
-# login rewritten minutes ago (a live session just refreshed it): no forced refresh
-setup; profile 1 7200 90000 a@x.io; touch "$HOME/.claude-1/.credentials.json"
-tb keepalive
-ok "recently renewed login is left alone" "[[ \$(calls) == 0 ]] && grep -q 'by a live session' <<<\"\$OUT\""
-teardown
-
 # dead refresh token: no claude call, tells the owner the login command
 setup; profile 4 -100 -50 d@x.io; TOKENBATON_PROFILES=4 tb keepalive
 ok "dead profile: not touched, login command given" "[[ \$(calls) == 0 ]] && grep -q 'tokenbaton login 4' <<<\"\$OUT\""
+ok "dead profile: notified" "grep -q 'profile 4 (d@x.io) is logged out' '$T/notify.calls'"
 teardown
 
 # fresh refresh lock (another process is refreshing): left alone
@@ -185,8 +187,10 @@ ok "dry-run reports idle windows without sending" \
    "grep -q 'profile 2.*would prime (5h+7d idle)' <<<\"\$OUT\" && ! grep -q -- ' -p ' '$T/claude.calls' 2>/dev/null"
 tb prime
 ok "running windows are left alone" "grep -q 'profile 1.*ok, windows running' <<<\"\$OUT\" && ! grep -q \"^\$HOME/.claude-1 -p\" '$T/claude.calls'"
-ok "idle account gets one tiny haiku message with no tools or session" \
+ok "idle account gets one short haiku question with no tools or session" \
    "[[ \$(grep -c \"^\$HOME/.claude-2 -p\" '$T/claude.calls') == 1 ]] && grep -q -- '--model haiku --tools  --strict-mcp-config --no-session-persistence' '$T/claude.calls'"
+ok "the prime message reads like an ordinary question" \
+   "grep \"^\$HOME/.claude-2 -p\" '$T/claude.calls' | grep -q '?' && ! grep -qi 'reply with just' '$T/claude.calls'"
 ok "primed account reports its new reset times and writes live.N" \
    "grep -q 'profile 2.*primed (5h+7d idle); now 5h 1%' <<<\"\$OUT\" && [[ \$(cut -d' ' -f1,3 '$T/acc/live.2') == '1 2' ]]"
 ok "dead login is skipped, nothing printed secret" \
