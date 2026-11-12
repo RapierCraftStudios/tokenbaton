@@ -177,9 +177,9 @@ tb status
 ok "status flags an existing duplicate" "grep -qE '^ +2 .*DUPLICATE of 1' <<<\"\$OUT\" && ! grep -qE '^ +1 .*DUPLICATE' <<<\"\$OUT\""
 teardown
 
-# --- prime
+# --- prime (delay 0 here; the random delay has its own tests below)
 setup; profile 1 7200 90000 a@x.io; profile 2 7200 90000 b@x.io; profile 3 -100 -50 c@x.io
-export TOKENBATON_USAGE_URL="file://$T/usage.{n}.json"
+export TOKENBATON_USAGE_URL="file://$T/usage.{n}.json" TOKENBATON_PRIME_DELAY_MIN=0 TOKENBATON_PRIME_DELAY_MAX=0
 echo '{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00+00:00"},"seven_day":{"utilization":20,"resets_at":"2099-01-05T00:00:00+00:00"}}' > "$T/usage.1.json"
 echo '{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":0,"resets_at":null}}' > "$T/usage.2.json"
 tb prime --dry-run
@@ -201,11 +201,32 @@ ok "failed prime is reported and exits non-zero" "grep -q 'profile 2.*FAILED to 
 export TOKENBATON_SYSTEMCTL="$T/bin/systemctl" TOKENBATON_UNIT_DIR="$T/units"
 printf '#!/bin/sh\necho "$@" >> "%s/systemctl.calls"\n' "$T" > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"
 tb prime --install
-ok "prime --install writes a 15-minute timer logging to prime.log" \
-   "grep -q '\\*:00/15' '$T/units/tokenbaton-prime.timer' && grep -q 'tokenbaton-ctl prime' '$T/units/tokenbaton-prime.service' && grep -q prime.log '$T/units/tokenbaton-prime.service' && grep -q 'enable --now tokenbaton-prime.timer' '$T/systemctl.calls'"
+ok "prime --install writes a 5-minute timer logging to prime.log" \
+   "grep -q 'RandomizedDelaySec=120' '$T/units/tokenbaton-prime.timer' && grep -q '\\*:00/5' '$T/units/tokenbaton-prime.timer' && grep -q 'tokenbaton-ctl prime' '$T/units/tokenbaton-prime.service' && grep -q prime.log '$T/units/tokenbaton-prime.service' && grep -q 'enable --now tokenbaton-prime.timer' '$T/systemctl.calls'"
 tb prime --uninstall
 ok "prime --uninstall removes its units" "[[ ! -e '$T/units/tokenbaton-prime.timer' ]]"
-unset TOKENBATON_USAGE_URL TOKENBATON_SYSTEMCTL TOKENBATON_UNIT_DIR
+unset TOKENBATON_USAGE_URL TOKENBATON_SYSTEMCTL TOKENBATON_UNIT_DIR TOKENBATON_PRIME_DELAY_MIN TOKENBATON_PRIME_DELAY_MAX
+teardown
+
+# --- prime waits a random delay after a window goes idle
+setup; profile 1 7200 90000 a@x.io
+export TOKENBATON_USAGE_URL="file://$T/usage.{n}.json" TOKENBATON_PRIME_DELAY_MIN=10 TOKENBATON_PRIME_DELAY_MAX=20
+echo '{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":4,"resets_at":"2099-01-05T00:00:00+00:00"}}' > "$T/usage.1.json"
+TOKENBATON_PROFILES=1 tb prime --dry-run
+ok "dry-run of a newly idle window schedules nothing" "[[ ! -e '$T/acc/prime.1' ]]"
+TOKENBATON_PROFILES=1 tb prime
+due=$(cat "$T/acc/prime.1" 2>/dev/null || echo 0); now=$(date +%s)
+ok "newly idle window is not primed at once" "! grep -q -- ' -p ' '$T/claude.calls' 2>/dev/null && grep -q '5h idle; primes in 1' <<<\"\$OUT\""
+ok "its prime time is 10-20 minutes out" "(( due >= now + 590 && due <= now + 1200 ))"
+TOKENBATON_PROFILES=1 tb prime
+ok "later runs keep the same prime time" "[[ \$(cat '$T/acc/prime.1') == $due ]] && ! grep -q -- ' -p ' '$T/claude.calls' 2>/dev/null"
+echo $(( now - 1 )) > "$T/acc/prime.1"
+TOKENBATON_PROFILES=1 tb prime
+ok "once due it is primed and the schedule cleared" "grep -q -- ' -p ' '$T/claude.calls' && [[ ! -e '$T/acc/prime.1' ]] && grep -q 'primed (5h idle)' <<<\"\$OUT\""
+echo 99999999999 > "$T/acc/prime.1"
+TOKENBATON_PROFILES=1 tb prime
+ok "a running window clears a leftover schedule" "[[ ! -e '$T/acc/prime.1' ]]"
+unset TOKENBATON_USAGE_URL TOKENBATON_PRIME_DELAY_MIN TOKENBATON_PRIME_DELAY_MAX
 teardown
 
 echo "$pass passed, $fail failed"
