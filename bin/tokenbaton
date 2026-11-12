@@ -10,12 +10,12 @@
 # Set TOKENBATON_SWITCH_AT=0 to turn this off. Manual switch: /exit, Enter.
 #   tokenbaton [N] [claude args...]   (N = starting profile; default: last used)
 #   tokenbaton --pick                  print the account with the most room right now
-#   tokenbaton status | keepalive [--dry-run|--install|--uninstall] | login <N>|--new
+#   tokenbaton status | keepalive|prime [--dry-run|--install|--uninstall] | login <N>|--new
 set -uo pipefail
 COUNT="${TOKENBATON_PROFILES:-5}"
 SWITCH_AT="${TOKENBATON_SWITCH_AT:-99}"
 POLL=60
-CHECK="${TOKENBATON_CHECK_EVERY:-15}"   # seconds between the watcher's usage checks
+CHECK="${TOKENBATON_CHECK_EVERY:-5}"   # seconds between the watcher's usage checks
 BACKOFF=300   # after a failed usage check (e.g. HTTP 429), wait this long
 ACC="${TOKENBATON_HOME:-$HOME/.tokenbaton}"
 PROFILE_CMD="$(dirname "$(readlink -f "$0")")/tokenbaton-profile"
@@ -36,7 +36,7 @@ mkdir -p "$ACC"
 
 # Account management subcommands (no Claude window): see tokenbaton-ctl.
 case "${1:-}" in
-  keepalive|login|status) exec "$(dirname "$(readlink -f "$0")")/tokenbaton-ctl" "$@" ;;
+  keepalive|prime|login|status) exec "$(dirname "$(readlink -f "$0")")/tokenbaton-ctl" "$@" ;;
 esac
 
 # The watcher sleeps every second in every window; use bash's loadable sleep
@@ -99,7 +99,7 @@ try:
     tok = json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"]
     req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
         "Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"})
-    d = json.load(urllib.request.urlopen(req, timeout=15))
+    d = json.load(urllib.request.urlopen(req, timeout=8))
     # The 5-hour and 7-day meters, every row of limits[] that isn't tied to one
     # model, and the row the server itself headlines.
     pct = [(d.get(k) or {}).get("utilization") or 0 for k in ("five_hour", "seven_day")]
@@ -175,22 +175,43 @@ launch() {
   "$PROFILE_CMD" "$1" --settings "{\"statusLine\":{\"type\":\"command\",\"command\":\"TOKENBATON_HOME='$ACC' '$STATUSLINE'\"}}" "${@:2}"
 }
 
-# Next logged-in profile after $1 with usage below the switch threshold.
-# Accounts are used one at a time: prefer the one the other windows moved to
-# (the shared last-used profile), so windows don't drift onto different
-# accounts and drain several at once.
-next_profile() {
-  local cur="$1" i n
-  n="$(cat "$STATE" 2>/dev/null)"
-  if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= COUNT && n != cur )) \
-     && logged_in "$n" && has_room "$n"; then
-    echo "$n"; return 0
+# Weekly quota at risk on profile $1: the percent of its weekly window still
+# unused, per hour left before that window resets (x1000). Unused weekly quota
+# is lost at the reset, so the account whose spare capacity runs out soonest
+# should be used first. A window that isn't running (never started, or already
+# reset) counts as 100% spread over a full week.
+urgency() {
+  local p5 r5 p7 r7 at now left
+  now="$(date +%s)"
+  if read -r p5 r5 p7 r7 at 2>/dev/null < "$ACC/live.$1" \
+     && [[ "$p7$r7" =~ ^[0-9]+$ ]] && (( r7 > now )); then
+    left=$(( r7 - now )); (( left < 900 )) && left=900
+    (( p7 > 100 )) && p7=100
+    echo $(( (100 - p7) * 3600000 / left ))
+  else
+    echo $(( 100 * 1000 / 168 ))
   fi
-  for (( i = 1; i < COUNT; i++ )); do
-    n=$(( (cur + i - 1) % COUNT + 1 ))
-    if logged_in "$n" && has_room "$n"; then echo "$n"; return 0; fi
-  done
-  return 1
+}
+
+# Logged-in profiles with usage below the switch threshold, best first (except
+# $1, if given): most weekly quota at risk, then lowest usage, then lowest
+# number. Every window ranks the same way, so windows that switch converge on
+# one account and use accounts up one after another. The accounts are checked
+# in parallel, so a switch waits for one endpoint round trip, not one per account.
+ranked() {
+  local skip="${1:-0}" n
+  for (( n = 1; n <= COUNT; n++ )); do
+    (( n == skip )) && continue
+    ( logged_in "$n" && has_room "$n" || exit 0
+      u="$(usage "$n")"; echo "$(urgency "$n") ${u:-0} $n" ) &
+  done | sort -k1,1nr -k2,2n -k3,3n | awk '{print $3}'
+}
+
+# The best logged-in profile other than $1 with room (see ranked).
+next_profile() {
+  local n
+  n="$(ranked "$1" | head -1)"
+  [[ -n "$n" ]] && echo "$n"
 }
 
 # Map an ID to a saved conversation. If no transcript has that name (the window
@@ -302,6 +323,11 @@ maybe_switch() {
   p="$child_profile"; [[ -n "$p" ]] || p="$(cat "$CUR" 2>/dev/null)"
   [[ "$p" =~ ^[0-9]+$ ]] || return 0
   u="$(usage "$p")"
+  # Getting close: refresh the other accounts' figures in the background, so
+  # the switch itself finds them cached and doesn't wait on the endpoint.
+  if [[ -n "$u" ]] && (( u >= SWITCH_AT - 10 && SECONDS - warmed >= POLL )); then
+    warmed=$SECONDS; ( ranked "$p" > /dev/null ) &
+  fi
   if [[ -z "$u" ]] || (( u < SWITCH_AT )); then
     sid="$(cat "$TRACK" 2>/dev/null)"; sid="${sid:-$last_sid}"
     limited_since "$(resolve_session "$sid" "$started")" "$started" || return 0
@@ -339,7 +365,7 @@ stop_tree() {
 }
 
 watch() {
-  local t=0 last_sid="" last_started="" child_profile=""
+  local t=0 last_sid="" last_started="" child_profile="" warmed=-100000
   while kill -0 "$$" 2>/dev/null; do
     snapshot
     (( t++ % CHECK == 0 )) && maybe_switch
@@ -358,21 +384,21 @@ trap 'signalled=idle' USR1
 trap 'signalled=shell' USR2
 
 profile="$(cat "$STATE" 2>/dev/null || echo 1)"
-# --pick: print the logged-in profile with the most room (lowest usage below the
-# switch threshold) and exit. Headless runs use it through tokenbaton-exec.
+# --pick: print the best logged-in profile with room (see ranked) and exit.
+# Headless runs use it through tokenbaton-exec.
 if [[ "${1:-}" == "--pick" ]]; then
-  best="" best_u=101
-  for (( n = 1; n <= COUNT; n++ )); do
-    logged_in "$n" && has_room "$n" || continue
-    u="$(usage "$n")"; u="${u:-0}"
-    if (( u < best_u )); then best="$n"; best_u="$u"; fi
-  done
+  best="$(ranked | head -1)"
   [[ -n "$best" ]] || { echo "tokenbaton: no logged-in account has room" >&2; exit 1; }
   echo "$best"
   exit 0
 fi
 
-if [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= COUNT )); then profile="$1"; shift; fi
+if [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= COUNT )); then
+  profile="$1"; shift
+elif [[ "${TOKENBATON_START:-best}" != last ]] && best="$(ranked | head -1)" && [[ -n "$best" ]]; then
+  # A new window starts on the best account, not the last-used one.
+  profile="$best"
+fi
 [[ "$profile" =~ ^[0-9]+$ ]] && (( profile >= 1 && profile <= COUNT )) || profile=1
 
 # Start pinned to a fresh ID unless the caller already chose a session.

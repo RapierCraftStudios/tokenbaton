@@ -41,6 +41,10 @@ tokenbaton login --new   # the next free profile number (creates ~/.claude-N)
 ```
 
 Extra arguments go to `claude auth login` (`--email you@example.com`, `--sso`).
+Each profile must be a different account: a login to an account that is already
+on another profile is rejected and the profile's previous login is put back, since
+two profiles on one account share a single usage pool. `tokenbaton status` marks an
+existing duplicate as `DUPLICATE of N`.
 If you use more than 5 profiles, set `TOKENBATON_PROFILES`.
 
 Your conversations, settings, memory, `CLAUDE.md`, commands, agents, skills, plugins
@@ -50,22 +54,28 @@ are shared by all of them. Only the login differs between accounts.
 ## Use
 
 ```sh
-tokenbaton                 # start on the last-used account
+tokenbaton                 # start on the best account (see "Which account")
 tokenbaton 2               # start on account 2
 tokenbaton 2 --resume ID   # any other arguments go straight to claude
 ```
 
 - **Auto-switch:** once the session (5-hour) or weekly usage reaches the threshold
-  and Claude is idle, the conversation moves to the next account that has room.
+  and Claude is idle, the conversation moves to the best other account that has room.
   A turn that is still running is never interrupted. Background tasks Claude started
   (e.g. `claude -p` workers) are stopped, and the conversation is asked to restart
   the ones it still needs.
 - **Manual switch:** type `/exit`, then press Enter at the `tokenbaton:` prompt. Type `q` to quit.
 - **Follows you around:** if you `/resume` or `/clear` inside Claude Code, tokenbaton
   moves on with the conversation you're in now.
-- **One account at a time:** a window that switches joins the account the other
-  windows moved to, if it has room, so accounts are used up one after another
-  rather than all at once.
+- **Which account:** new windows, switches and headless runs all go to the account
+  with the most weekly quota at risk: the unused share of its weekly window per hour
+  left before that window resets. Unused weekly quota is lost at the reset, so an
+  account at 3% that resets in 18 hours goes before one at 6% that resets in 5 days.
+  A weekly window that isn't running counts as a full week. Ties go to the lower
+  usage; accounts at the switch threshold are skipped. Every window ranks the same
+  way, so windows converge on one account and use accounts up one after another.
+  `tokenbaton N` still starts on account N, and `TOKENBATON_START=last` starts new
+  windows on the last-used account instead.
 - **Every account full:** tokenbaton stays where it is and offers the manual prompt.
 
 ## Account health
@@ -110,6 +120,25 @@ How a renewal is done, and why it is safe:
 - A profile whose refresh token has already expired is reported as `DEAD` with the
   `tokenbaton login N` command; it cannot be revived without logging in.
 
+## Start idle usage clocks
+
+A usage window only starts counting down when the account is next used, so an account
+that sat idle after a reset loses that time. `tokenbaton prime` checks every logged-in
+account on the usage endpoint and, for each one whose 5-hour or weekly window isn't
+running, sends one tiny message (`claude -p` on Haiku, no tools, no MCP servers, no
+saved session) so the reset clock starts now. Accounts whose windows are already
+running are left alone. An expired access token is renewed first, as in `keepalive`.
+
+```sh
+tokenbaton prime --dry-run    # report which accounts would be primed
+tokenbaton prime              # prime them now
+tokenbaton prime --install    # systemd user timer, every 15 minutes, log: ~/.tokenbaton/prime.log
+tokenbaton prime --uninstall
+# without systemd:  */15 * * * * ~/.local/bin/tokenbaton prime >> ~/.tokenbaton/prime.log 2>&1
+```
+
+Each prime costs one very small Haiku request on that account.
+
 ## Headless runs
 
 Background tools that start `claude` themselves (`claude -p` scripts, CI helpers,
@@ -130,6 +159,7 @@ env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
 - The pick uses the same login check and usage figures as the windows (status-line
   data and the shared usage endpoint, whichever is higher), covering the 5-hour, the
   weekly and every other account-wide limit.
+- The pick uses the same ranking as new windows (see "Which account").
 - Only accounts below `TOKENBATON_SWITCH_AT` are picked. For workers that run for a
   long time, a lower threshold (e.g. `TOKENBATON_SWITCH_AT=90`) leaves headroom.
 - If no account has room, the command still runs, on the profile it was started with.
@@ -138,10 +168,13 @@ env -u CLAUDE_CONFIG_DIR PATH="$HOME/.tokenbaton/shim:$PATH" my-orchestrator ...
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `TOKENBATON_CHECK_EVERY` | `5` | Seconds between usage checks in each window (how soon an idle, full account is switched). |
 | `TOKENBATON_SWITCH_AT` | `99` | Usage percent that triggers a switch. `0` turns auto-switch off. |
 | `TOKENBATON_PROFILES` | `5` | Number of account profiles (`~/.claude-1` … `~/.claude-N`). |
 | `TOKENBATON_HOME` | `~/.tokenbaton` | Where tokenbaton keeps its own small state files. |
 | `TOKENBATON_KEEPALIVE_HOURS` | `48` | `keepalive` renews a login whose refresh token expires within this many hours. |
+| `TOKENBATON_START` | `best` | `last` starts a new window on the last-used account instead of the best one. |
+| `TOKENBATON_PRIME_MODEL` | `haiku` | Model `prime` sends its message with. |
 
 ## How it works
 

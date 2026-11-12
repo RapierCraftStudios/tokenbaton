@@ -25,10 +25,15 @@ if [[ "$1 $2" == "auth status" ]]; then
     [[ -n "${STUB_LEAK_LOCK:-}" ]] && mkdir -p "$d.lock"
   fi
   exit 0
+elif [[ "$1" == "-p" ]]; then
+  [[ -n "${STUB_PRIME_FAIL:-}" ]] && { echo "boom" >&2; exit 3; }
+  # A message starts the account's idle windows.
+  n="${d##*-}"; echo '{"five_hour":{"utilization":1,"resets_at":"2099-01-01T00:00:00.5+00:00"},"seven_day":{"utilization":2,"resets_at":"2099-01-05T00:00:00+00:00"}}' > "$TB_TEST/usage.$n.json"
+  echo ok; exit 0
 elif [[ "$1 $2" == "auth login" ]]; then
   [[ -n "${STUB_LOGIN_FAIL:-}" ]] && exit 1
   echo "{\"claudeAiOauth\":{\"accessToken\":\"A\",\"refreshToken\":\"R\",\"expiresAt\":$(( now + 28800000 )),\"refreshTokenExpiresAt\":$(( now + 90000000 ))}}" > "$d/.credentials.json"
-  echo '{"oauthAccount":{"emailAddress":"new@example.com"}}' > "$d/.claude.json"
+  echo "{\"oauthAccount\":{\"emailAddress\":\"${STUB_LOGIN_EMAIL:-new@example.com}\",\"accountUuid\":\"${STUB_LOGIN_UUID:-u-new}\",\"organizationUuid\":\"org\"}}" > "$d/.claude.json"
 fi
 SH
   chmod +x "$T/bin/"*
@@ -144,12 +149,59 @@ tb login 2
 ok "login N runs claude auth login in that profile and prints the email" \
    "[[ \$RC == 0 ]] && grep -q 'auth login' '$T/claude.calls' && grep -q \"^\$HOME/.claude-2 \" '$T/claude.calls' && grep -q new@example.com <<<\"\$OUT\""
 ok "login does not move the current-account marker" "[[ \$(cat '$T/acc/current') == 1 ]]"
-tb login --new
+STUB_LOGIN_UUID=u-other tb login --new
 ok "login --new picks the next free profile" "grep -q \"^\$HOME/.claude-3 \" '$T/claude.calls' && [[ -f '$HOME/.claude-3/.credentials.json' ]]"
 STUB_LOGIN_FAIL=1 tb login 3
 ok "failed login exits non-zero" "[[ \$RC != 0 ]]"
 tb login x
 ok "bad argument rejected" "[[ \$RC == 2 ]]"
+teardown
+
+# --- login rejects an account already on another profile
+setup; mkdir -p "$HOME/.claude"
+profile 1 7200 90000 a@x.io; echo '{"oauthAccount":{"emailAddress":"a@x.io","accountUuid":"u-a","organizationUuid":"org"}}' > "$HOME/.claude-1/.claude.json"
+profile 2 7200 90000 b@x.io; echo '{"oauthAccount":{"emailAddress":"b@x.io","accountUuid":"u-b","organizationUuid":"org"}}' > "$HOME/.claude-2/.claude.json"
+cp "$HOME/.claude-2/.credentials.json" "$T/creds2.before"
+STUB_LOGIN_EMAIL=a@x.io STUB_LOGIN_UUID=u-a tb login 2
+ok "duplicate login is rejected and names the other profile" "[[ \$RC == 1 ]] && grep -q 'rejected: a@x.io is already logged in on profile 1' <<<\"\$OUT\""
+ok "rejected login puts the profile's previous login back" \
+   "cmp -s '$T/creds2.before' '$HOME/.claude-2/.credentials.json' && grep -q b@x.io '$HOME/.claude-2/.claude.json'"
+STUB_LOGIN_EMAIL=a@x.io STUB_LOGIN_UUID=u-a tb login 3
+ok "duplicate on a fresh profile leaves it logged out" "[[ \$RC == 1 && ! -e '$HOME/.claude-3/.credentials.json' ]]"
+STUB_LOGIN_EMAIL=a@x.io STUB_LOGIN_UUID=u-a tb login 1
+ok "re-logging a profile into its own account is fine" "[[ \$RC == 0 ]]"
+echo '{"oauthAccount":{"emailAddress":"a@x.io","accountUuid":"u-a","organizationUuid":"org"}}' > "$HOME/.claude-2/.claude.json"
+tb status
+ok "status flags an existing duplicate" "grep -qE '^ +2 .*DUPLICATE of 1' <<<\"\$OUT\" && ! grep -qE '^ +1 .*DUPLICATE' <<<\"\$OUT\""
+teardown
+
+# --- prime
+setup; profile 1 7200 90000 a@x.io; profile 2 7200 90000 b@x.io; profile 3 -100 -50 c@x.io
+export TOKENBATON_USAGE_URL="file://$T/usage.{n}.json"
+echo '{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00+00:00"},"seven_day":{"utilization":20,"resets_at":"2099-01-05T00:00:00+00:00"}}' > "$T/usage.1.json"
+echo '{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":0,"resets_at":null}}' > "$T/usage.2.json"
+tb prime --dry-run
+ok "dry-run reports idle windows without sending" \
+   "grep -q 'profile 2.*would prime (5h+7d idle)' <<<\"\$OUT\" && ! grep -q -- ' -p ' '$T/claude.calls' 2>/dev/null"
+tb prime
+ok "running windows are left alone" "grep -q 'profile 1.*ok, windows running' <<<\"\$OUT\" && ! grep -q \"^\$HOME/.claude-1 -p\" '$T/claude.calls'"
+ok "idle account gets one tiny haiku message with no tools or session" \
+   "[[ \$(grep -c \"^\$HOME/.claude-2 -p\" '$T/claude.calls') == 1 ]] && grep -q -- '--model haiku --tools  --strict-mcp-config --no-session-persistence' '$T/claude.calls'"
+ok "primed account reports its new reset times and writes live.N" \
+   "grep -q 'profile 2.*primed (5h+7d idle); now 5h 1%' <<<\"\$OUT\" && [[ \$(cut -d' ' -f1,3 '$T/acc/live.2') == '1 2' ]]"
+ok "dead login is skipped, nothing printed secret" \
+   "grep -q 'profile 3.*skipped: not logged in' <<<\"\$OUT\" && ! grep -q SECRET <<<\"\$OUT\" && [[ \$RC == 0 ]]"
+echo '{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":3,"resets_at":"2099-01-05T00:00:00+00:00"}}' > "$T/usage.2.json"
+STUB_PRIME_FAIL=1 tb prime
+ok "failed prime is reported and exits non-zero" "grep -q 'profile 2.*FAILED to prime: claude exited 3: boom' <<<\"\$OUT\" && [[ \$RC == 1 ]]"
+export TOKENBATON_SYSTEMCTL="$T/bin/systemctl" TOKENBATON_UNIT_DIR="$T/units"
+printf '#!/bin/sh\necho "$@" >> "%s/systemctl.calls"\n' "$T" > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"
+tb prime --install
+ok "prime --install writes a 15-minute timer logging to prime.log" \
+   "grep -q '\\*:00/15' '$T/units/tokenbaton-prime.timer' && grep -q 'tokenbaton-ctl prime' '$T/units/tokenbaton-prime.service' && grep -q prime.log '$T/units/tokenbaton-prime.service' && grep -q 'enable --now tokenbaton-prime.timer' '$T/systemctl.calls'"
+tb prime --uninstall
+ok "prime --uninstall removes its units" "[[ ! -e '$T/units/tokenbaton-prime.timer' ]]"
+unset TOKENBATON_USAGE_URL TOKENBATON_SYSTEMCTL TOKENBATON_UNIT_DIR
 teardown
 
 echo "$pass passed, $fail failed"
