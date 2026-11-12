@@ -229,5 +229,18 @@ ok "a running window clears a leftover schedule" "[[ ! -e '$T/acc/prime.1' ]]"
 unset TOKENBATON_USAGE_URL TOKENBATON_PRIME_DELAY_MIN TOKENBATON_PRIME_DELAY_MAX
 teardown
 
+# --- tokenbaton-profile shares the live-session registry
+setup; mkdir -p "$HOME/.claude" "$HOME/.claude-1/sessions" "$HOME/.claude-2"
+echo '{"pid":111}' > "$HOME/.claude-1/sessions/111.json"; echo k > "$HOME/.claude-1/sessions/111.abc.key"
+"$T/bin/tokenbaton-profile" 2 --version >/dev/null 2>&1
+ok "every profile's sessions/ links to ~/.claude/sessions" \
+   "[[ \$(readlink '$HOME/.claude-1/sessions') == '$HOME/.claude/sessions' && \$(readlink '$HOME/.claude-2/sessions') == '$HOME/.claude/sessions' ]]"
+ok "existing session records and keys are moved into the shared registry" \
+   "[[ -f '$HOME/.claude/sessions/111.json' && -f '$HOME/.claude/sessions/111.abc.key' ]]"
+ok "the shared registry is private (0700)" "[[ \$(stat -c %a '$HOME/.claude/sessions') == 700 ]]"
+"$T/bin/tokenbaton-profile" 1 --version >/dev/null 2>&1
+ok "relaunching keeps the links as they are" "[[ -L '$HOME/.claude-1/sessions' && -f '$HOME/.claude/sessions/111.json' ]]"
+teardown
+
 echo "$pass passed, $fail failed"
 (( fail == 0 ))

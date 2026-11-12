@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run the official Claude Code CLI under one of N account profiles.
-# Each profile (~/.claude-N) keeps its own login; sessions, memory, settings,
-# plugins and prompt history are symlinked to ~/.claude so they are shared.
+# Each profile (~/.claude-N) keeps its own login; conversations, memory, settings,
+# plugins, prompt history and the live-session registry (sessions/, which Claude
+# Code uses to find and message other sessions) are symlinked to ~/.claude so
+# they are shared, and sessions on different accounts can talk to each other.
 #   tokenbaton-profile <N> [claude args...]
 set -euo pipefail
 
@@ -39,8 +41,27 @@ relink() {
   ln -sfn "$src" "$dst"
 }
 
+# Share the live-session registry: every profile's sessions/ points at
+# ~/.claude/sessions. A profile's own folder (from before this) has its records
+# moved over first; they're named by pid, so nothing collides. Done for every
+# profile, so sessions already running elsewhere become visible too.
+share_sessions() {
+  local d="$1" f
+  [[ -d "$d" && ! -L "$d/sessions" ]] || return 0
+  if [[ -d "$d/sessions" ]]; then
+    for f in "$d/sessions"/* "$d/sessions"/.[!.]*; do
+      [[ -e "$f" ]] && mv -n "$f" "$BASE/sessions/" 2>/dev/null
+    done
+    rmdir "$d/sessions" 2>/dev/null || return 0   # a record landed meanwhile: next launch
+  fi
+  ln -s "$BASE/sessions" "$d/sessions" 2>/dev/null || true
+}
+mkdir -p "$BASE/sessions" && chmod 700 "$BASE/sessions" 2>/dev/null || true
+for (( i = 1; i <= COUNT; i++ )); do share_sessions "$HOME/.claude-$i"; done
+
 dir="$HOME/.claude-$n"
 mkdir -p "$dir"
+share_sessions "$dir"
 for item in "${SHARED[@]}"; do
   src="$BASE/$item"
   dst="$dir/$item"

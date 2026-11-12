@@ -3,7 +3,7 @@
 # conversation this window was last in, on the next logged-in account, in the
 # same window.
 # Follows in-session /resume and /clear by watching Claude Code's live session
-# record ($CLAUDE_CONFIG_DIR/sessions/<pid>.json) for this window's process.
+# record (~/.claude/sessions/<pid>.json, shared by every profile) for this window's process.
 # Auto-switch: once the account's session (5-hour) usage reaches
 # TOKENBATON_SWITCH_AT percent (default 99) and Claude is idle, it is closed and
 # the conversation resumes on the next account with room, without prompting.
@@ -273,14 +273,36 @@ assert ts * 1000 >= int(sys.argv[1]) and (not reset or reset > time.time())
 # Record the sessionId of whichever claude process is our direct child, and
 # leave its pid, start time (epoch ms), status ("idle", "busy", ...), profile
 # and session in $child / $started / $status / $child_profile / $last_sid.
-# The profile comes from the folder the session record is in, so it is known
-# even when $CUR is missing. $TRACK and $STARTED_F are written again if they
+# The profile comes from the process's CLAUDE_CONFIG_DIR (or, for a profile
+# with its own sessions/ folder, the folder the record is in), so it is known
+# even when $CUR is missing. Records live in the shared ~/.claude/sessions,
+# which every profile's sessions/ links to. $TRACK and $STARTED_F are written again if they
 # disappear (another process removed them, or a write failed on a full disk).
+# Set $pp_val to the profile N of claude process $1, from its CLAUDE_CONFIG_DIR
+# (read without forking), else $CUR. Cached per pid in $pp_pid/$pp_val: a
+# process's environment doesn't change.
+pid_profile() {
+  local e
+  [[ "$1" == "$pp_pid" && -n "$pp_val" ]] && return
+  pp_pid="$1"; pp_val=""
+  if [[ -r "/proc/$1/environ" ]]; then
+    while IFS= read -r -d '' e; do
+      [[ "$e" == CLAUDE_CONFIG_DIR=* ]] || continue
+      e="${e%/}"; e="${e##*/.claude-}"; [[ "$e" =~ ^[0-9]+$ ]] && pp_val="$e"; break
+    done < "/proc/$1/environ"
+  fi
+  if [[ -z "$pp_val" ]]; then
+    { pp_val="$(< "$CUR")"; } 2>/dev/null; [[ "$pp_val" =~ ^[0-9]+$ ]] || pp_val=""
+  fi
+}
+
 snapshot() {
-  local f pid sid st c
+  local f pid sid st c d
   child=""; status=""; started=""; child_profile=""
-  for f in "$HOME"/.claude-[0-9]*/sessions/*.json; do
+  # The shared registry, plus any profile still on a folder of its own.
+  for f in "$HOME"/.claude/sessions/*.json "$HOME"/.claude-[0-9]*/sessions/*.json; do
     [[ -e "$f" ]] || continue
+    d="${f%/*}"; [[ "$d" == "$HOME/.claude/sessions" || ! -L "$d" ]] || continue
     pid="${f##*/}"; pid="${pid%.json}"
     # Parent pid from /proc without forking (the 4th stat field, after "(comm) state");
     # ps where there is no /proc (macOS).
@@ -299,7 +321,7 @@ snapshot() {
     fi
     child="$pid"
     child_profile="${f%/sessions/*}"; child_profile="${child_profile##*/.claude-}"
-    [[ "$child_profile" =~ ^[0-9]+$ ]] || child_profile=""
+    [[ "$child_profile" =~ ^[0-9]+$ ]] || { pid_profile "$pid"; child_profile="$pp_val"; }
     started=""; [[ "$c" =~ \"startedAt\":([0-9]*) ]] && started="${BASH_REMATCH[1]}"
     status=""; [[ "$c" =~ \"status\":\"([^\"]*)\" ]] && status="${BASH_REMATCH[1]}"
   done
@@ -365,7 +387,7 @@ stop_tree() {
 }
 
 watch() {
-  local t=0 last_sid="" last_started="" child_profile="" warmed=-100000
+  local t=0 last_sid="" last_started="" child_profile="" warmed=-100000 pp_pid="" pp_val=""
   while kill -0 "$$" 2>/dev/null; do
     snapshot
     (( t++ % CHECK == 0 )) && maybe_switch
